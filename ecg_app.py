@@ -3090,8 +3090,9 @@ class WaveformWidget(QWidget):
 
     def _build(self):
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(2)
+        # 左、上、右、下留白：避免軌道標題與縱軸標籤貼齊視窗邊緣
+        lay.setContentsMargins(16, 8, 10, 10)
+        lay.setSpacing(4)
 
         # ── CH0 header row ──
         hdr0 = QHBoxLayout()
@@ -3174,6 +3175,9 @@ class WaveformWidget(QWidget):
         # 疊圖、點位線與波形之間的對照全都會歪掉。
         for _pl in (self.plot_wave, self.plot_wave2, self.plot_rr):
             _pl.getPlotItem().getAxis('left').setWidth(62)
+            # 拖進來的檔案交給主視窗處理（詢問是否開啟新檔案）
+            _pl.setAcceptDrops(False)
+            _pl.viewport().setAcceptDrops(False)
 
         # 預建持久曲線
         self._curve_wave  = self.plot_wave.plot([], [], pen=pg.mkPen(C['wave'], width=1.0))
@@ -7732,18 +7736,84 @@ S3 演算法（移除心電干擾）：
         else:
             super().keyReleaseEvent(event)
 
+    # ── 拖放檔案開啟 ────────────────────────────────────────────────────────
+    # 分析畫面上直接把 .abf / .edf / .acq 拖進來即可開啟；
+    # 已有開啟中的檔案時會先跳視窗確認，避免誤拖把目前的分析換掉。
+
+    @staticmethod
+    def _dropped_file(e) -> str | None:
+        md = e.mimeData()
+        if not md.hasUrls():
+            return None
+        for u in md.urls():
+            path = u.toLocalFile()
+            if path and path.lower().endswith(SUPPORTED_EXTS) and os.path.isfile(path):
+                return path
+        return None
+
     def dragEnterEvent(self, e: QDragEnterEvent):
-        if e.mimeData().hasUrls():
-            urls = e.mimeData().urls()
-            if any(u.toLocalFile().lower().endswith(('.abf', '.edf')) for u in urls):
-                e.acceptProposedAction()
+        path = self._dropped_file(e)
+        if path:
+            e.acceptProposedAction()
+            if self.ecg_data is not None:
+                self._drop_prev_status = self.lbl_status.text()
+                self.lbl_status.setText(f'📂 放開以開啟：{os.path.basename(path)}')
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        if self._dropped_file(e):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragLeaveEvent(self, e):
+        prev = getattr(self, '_drop_prev_status', None)
+        if prev is not None:
+            self.lbl_status.setText(prev)
+            self._drop_prev_status = None
 
     def dropEvent(self, e: QDropEvent):
-        for url in e.mimeData().urls():
-            path = url.toLocalFile()
-            if path.lower().endswith(('.abf', '.edf')):
-                self.open_file(path)
-                break
+        path = self._dropped_file(e)
+        prev = getattr(self, '_drop_prev_status', None)
+        if prev is not None:
+            self.lbl_status.setText(prev)
+            self._drop_prev_status = None
+        if not path:
+            e.ignore()
+            return
+        e.acceptProposedAction()
+        # 等拖放動作結束後再跳視窗，否則 macOS 的 Finder 會卡在拖曳狀態
+        QTimer.singleShot(0, lambda p=path: self._open_dropped_file(p))
+
+    def _open_dropped_file(self, path: str):
+        if self.ecg_data is None:
+            self.open_file(path)
+            return
+        cur_path = getattr(self.ecg_data, 'path', '') or ''
+        new_name = os.path.basename(path)
+        cur_name = os.path.basename(cur_path) if cur_path else '目前的檔案'
+        if cur_path and os.path.abspath(cur_path) == os.path.abspath(path):
+            msg = (f'「{new_name}」目前已經開啟。\n\n'
+                   '要重新載入這個檔案嗎？')
+            title = '重新載入檔案'
+        else:
+            msg = (f'要開啟新檔案嗎？\n\n'
+                   f'新檔案：{new_name}\n'
+                   f'目前檔案：{cur_name}（將會關閉）\n\n'
+                   '時間戳記與 SKNA 標記點會自動儲存；\n'
+                   '尚未匯出的分析結果（例如 R-peak 手動修改、SKNA 區間表）請先匯出。')
+            title = '開啟新檔案'
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(title)
+        box.setText(msg)
+        btn_open = box.addButton('開啟', QMessageBox.ButtonRole.AcceptRole)
+        box.addButton('取消', QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_open)
+        box.exec()
+        if box.clickedButton() is btn_open:
+            self.open_file(path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
