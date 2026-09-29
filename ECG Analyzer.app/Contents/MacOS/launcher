@@ -1,0 +1,37 @@
+#!/bin/bash
+# ECG Analyzer launcher — 執行 App 內的 ecg_app.py
+# （macOS 隱私保護不允許 App 讀取「桌面」資料夾，所以程式放在 App 裡面）
+export PATH="/usr/local/bin:/opt/homebrew/bin:/Library/Frameworks/Python.framework/Versions/Current/bin:/usr/bin:/bin:$PATH"
+export LANG="${LANG:-zh_TW.UTF-8}"
+
+# Apple 晶片：強制用原生 arm64 執行（避免被 Rosetta 以 Intel 模式啟動）
+RUN=()
+if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then RUN=(arch -arm64); fi
+
+RES="$(cd "$(dirname "$0")/../Resources" && pwd)"
+SCRIPT="$RES/ecg_app.py"
+export ECG_APP_ICON="$RES/AppIcon.png"
+mkdir -p "$HOME/Library/Logs"
+LOG="$HOME/Library/Logs/ECG Analyzer.log"
+echo "=== ECG Analyzer launch $(date) ===" >"$LOG"
+
+PYTHON=""; FIRST=""
+for p in /usr/local/bin/python3.13 /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 \
+         /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3 /usr/local/bin/python3 \
+         python3.13 python3.12 python3.11 python3.10 python3; do
+    f=$(command -v "$p" 2>/dev/null) || continue
+    [ -z "$FIRST" ] && FIRST="$f"
+    if "${RUN[@]}" "$f" -c "import PyQt6.QtWidgets" >>"$LOG" 2>&1; then PYTHON="$f"; break; fi
+done
+[ -z "$PYTHON" ] && PYTHON="$FIRST"
+echo "using: $PYTHON" >>"$LOG"
+if [ -z "$PYTHON" ]; then
+    osascript -e 'display alert "ECG Analyzer 無法啟動" message "找不到 Python。"'; exit 1
+fi
+
+cd "$HOME"
+"${RUN[@]}" "$PYTHON" "$SCRIPT" "$@" >>"$LOG" 2>&1
+code=$?
+if [ $code -ne 0 ]; then
+    osascript -e "display alert \"ECG Analyzer 發生錯誤 (code $code)\" message \"錯誤記錄：~/Library/Logs/ECG Analyzer.log\""
+fi

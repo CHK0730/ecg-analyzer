@@ -1,0 +1,7 @@
+PyQt6>=6.6
+pyqtgraph>=0.13
+numpy>=1.24
+scipy>=1.10
+pyabf>=2.3
+bioread>=3.0
+openpyxl>=3.1

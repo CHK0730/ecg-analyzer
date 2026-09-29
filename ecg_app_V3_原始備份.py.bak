@@ -1,0 +1,2958 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+"""
+ECG Analyzer V3 — Main Application
+====================================
+Mac App 主程式，使用 PyQt6 + pyqtgraph 建立原生視窗介面
+功能：
+  - 拖放或選擇 .abf / .edf 檔案
+  - 互動式波形瀏覽（縮放、平移）
+  - 時間測量工具
+  - 時間戳記管理與儲存 (JSON + CSV)
+  - R-peak 自動偵測
+  - 截圖匯出
+"""
+
+import sys
+import os
+import json
+import csv
+import struct
+import datetime
+import traceback
+
+# ── 依賴確認 ──────────────────────────────────────────────────────────────────
+def check_deps():
+    missing = []
+    for pkg in ['PyQt6', 'pyqtgraph', 'numpy', 'scipy']:
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+    return missing
+
+missing = check_deps()
+if missing:
+    try:
+        from PyQt6.QtWidgets import QApplication, QMessageBox
+        app = QApplication(sys.argv)
+        QMessageBox.critical(None, "缺少套件",
+            f"請先執行 install.command 安裝以下套件：\n\n" +
+            "\n".join(missing))
+        sys.exit(1)
+    except Exception:
+        print(f"[ERROR] 缺少套件：{missing}")
+        print("請執行 install.command")
+        sys.exit(1)
+
+# ── 正式 import ───────────────────────────────────────────────────────────────
+import numpy as np
+try:
+    import pyabf
+    _PYABF_OK = True
+except ImportError:
+    _PYABF_OK = False
+from scipy.signal import find_peaks, butter, filtfilt, iirnotch
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QSplitter, QToolBar, QStatusBar, QFileDialog, QDialog,
+    QLabel, QPushButton, QLineEdit, QTextEdit, QGroupBox,
+    QListWidget, QListWidgetItem, QMessageBox, QInputDialog,
+    QFrame, QScrollArea, QSizePolicy, QComboBox, QCheckBox,
+    QProgressBar, QSlider, QSpinBox, QDoubleSpinBox,
+    QRadioButton, QButtonGroup,
+)
+from PyQt6.QtCore import (
+    Qt, QThread, pyqtSignal, QTimer, QSize, QRectF, QPointF,
+    QSettings,
+)
+from PyQt6.QtGui import (
+    QAction, QIcon, QFont, QColor, QPalette, QDragEnterEvent,
+    QDropEvent, QKeySequence, QPixmap, QPainter, QLinearGradient,
+)
+
+import pyqtgraph as pg
+from pyqtgraph import PlotWidget, InfiniteLine, LinearRegionItem
+
+# ── pyqtgraph 全局設定 ────────────────────────────────────────────────────────
+pg.setConfigOptions(antialias=True, background='#0d1117', foreground='#e6edf3')
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 顏色主題
+# ══════════════════════════════════════════════════════════════════════════════
+C = {
+    'bg':       '#0d1117',
+    'panel':    '#161b22',
+    'border':   '#30363d',
+    'text':     '#e6edf3',
+    'dim':      '#8b949e',
+    'accent':   '#58a6ff',
+    'green':    '#3fb950',
+    'yellow':   '#d29922',
+    'red':      '#f85149',
+    'orange':   '#ffa657',
+    'purple':   '#bc8cff',
+    'wave':     '#388bfd',
+    'wave_alt': '#56d364',
+    'ts_color': '#ffa657',
+    'meas_a':   '#ff7b72',
+    'meas_b':   '#79c0ff',
+}
+
+STYLESHEET = f"""
+QMainWindow, QWidget {{
+    background-color: {C['bg']};
+    color: {C['text']};
+    font-family: 'SF Mono', 'Menlo', 'Consolas', 'Cascadia Mono', monospace;
+    font-size: 12px;
+}}
+QToolBar {{
+    background: {C['panel']};
+    border-bottom: 1px solid {C['border']};
+    spacing: 4px;
+    padding: 4px 8px;
+}}
+QToolBar QToolButton {{
+    background: {C['panel']};
+    color: {C['accent']};
+    border: 1px solid {C['border']};
+    border-radius: 5px;
+    padding: 5px 10px;
+    font-size: 12px;
+}}
+QToolBar QToolButton:hover {{
+    background: {C['border']};
+    color: {C['text']};
+}}
+QToolBar QToolButton:pressed {{
+    background: {C['accent']};
+    color: {C['bg']};
+}}
+QToolBar QToolButton:checked {{
+    background: {C['yellow']};
+    color: {C['bg']};
+    border-color: {C['yellow']};
+    font-weight: bold;
+}}
+QToolBar QToolButton:checked:hover {{
+    background: #e6b030;
+    color: {C['bg']};
+}}
+QPushButton {{
+    background: {C['panel']};
+    color: {C['accent']};
+    border: 1px solid {C['border']};
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 12px;
+}}
+QPushButton:hover {{ background: {C['border']}; color: {C['text']}; }}
+QPushButton:pressed {{ background: {C['accent']}; color: {C['bg']}; }}
+QPushButton#btn_danger {{
+    color: {C['red']};
+    border-color: {C['red']};
+}}
+QPushButton#btn_success {{
+    color: {C['green']};
+    border-color: {C['green']};
+}}
+QGroupBox {{
+    border: 1px solid {C['border']};
+    border-radius: 8px;
+    margin-top: 10px;
+    padding-top: 10px;
+    font-weight: bold;
+    color: {C['dim']};
+    font-size: 11px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 10px;
+    top: -2px;
+}}
+QListWidget {{
+    background: {C['panel']};
+    border: 1px solid {C['border']};
+    border-radius: 6px;
+    color: {C['text']};
+    font-size: 11px;
+}}
+QListWidget::item:selected {{
+    background: {C['accent']};
+    color: {C['bg']};
+}}
+QListWidget::item:hover {{
+    background: {C['border']};
+}}
+QLabel {{
+    color: {C['text']};
+}}
+QLabel#label_dim {{
+    color: {C['dim']};
+    font-size: 11px;
+}}
+QLabel#label_value {{
+    color: {C['accent']};
+    font-size: 13px;
+    font-weight: bold;
+}}
+QLineEdit, QTextEdit {{
+    background: {C['panel']};
+    border: 1px solid {C['border']};
+    border-radius: 5px;
+    color: {C['text']};
+    padding: 4px 8px;
+    font-size: 12px;
+}}
+QLineEdit:focus, QTextEdit:focus {{
+    border-color: {C['accent']};
+}}
+QStatusBar {{
+    background: {C['panel']};
+    color: {C['dim']};
+    border-top: 1px solid {C['border']};
+    font-size: 11px;
+}}
+QSlider::groove:horizontal {{
+    height: 4px;
+    background: {C['border']};
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    background: {C['accent']};
+    width: 14px;
+    height: 14px;
+    margin: -5px 0;
+    border-radius: 7px;
+}}
+QSlider::sub-page:horizontal {{
+    background: {C['accent']};
+    border-radius: 2px;
+}}
+QComboBox {{
+    background: {C['panel']};
+    border: 1px solid {C['border']};
+    border-radius: 5px;
+    color: {C['text']};
+    padding: 4px 8px;
+    min-width: 80px;
+}}
+QComboBox::drop-down {{ border: none; }}
+QScrollBar:vertical {{
+    background: {C['panel']};
+    width: 8px;
+}}
+QScrollBar::handle:vertical {{
+    background: {C['border']};
+    border-radius: 4px;
+    min-height: 20px;
+}}
+QSplitter::handle {{
+    background: {C['border']};
+}}
+QFrame#divider {{
+    color: {C['border']};
+}}
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 工具函數
+# ══════════════════════════════════════════════════════════════════════════════
+def fmt_hms(sec: float) -> str:
+    if sec is None or sec < 0:
+        return '--:--'
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    if h > 0:
+        return f'{h:02d}:{m:02d}:{s:06.3f}'
+    return f'{m:02d}:{s:06.3f}'
+
+
+def fmt_ms(sec: float) -> str:
+    return f'{sec * 1000:.2f} ms'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 資料載入
+# ══════════════════════════════════════════════════════════════════════════════
+class ABFData:
+    def __init__(self, path: str):
+        if not _PYABF_OK:
+            raise ImportError("開啟 .abf 檔案需要 pyabf 套件。\n請執行 install.command 安裝。")
+        self.path = path
+        self.abf = pyabf.ABF(path)
+        self.fs = self.abf.sampleRate
+        self.n_ch = self.abf.channelCount
+        self.ch_names = list(self.abf.adcNames)
+        self.ch_units = list(self.abf.adcUnits)
+        self.channels: dict[int, np.ndarray] = {}
+        self._load()
+
+    def _load(self):
+        for i in range(self.n_ch):
+            self.abf.setSweep(0, channel=i)
+            self.channels[i] = self.abf.sweepY.copy()
+
+    @property
+    def rec_datetime(self):
+        return getattr(self.abf, 'abfDateTime', None)
+
+    def abs_time(self, rel_sec: float):
+        t0 = self.rec_datetime
+        if t0 is None:
+            return fmt_hms(rel_sec)
+        abs_t = t0 + datetime.timedelta(seconds=rel_sec)
+        return abs_t.strftime('%H:%M:%S.%f')[:-3]
+
+    def info(self) -> dict:
+        rec = self.rec_datetime
+        end = (rec + datetime.timedelta(seconds=self.duration)) if rec else None
+        return {
+            'file':      os.path.basename(self.path),
+            'fs':        self.fs,
+            'duration':  self.duration,
+            'channels':  self.n_ch,
+            'protocol':  self.abf.protocol,
+            'rec_date':  rec.strftime('%Y-%m-%d') if rec else '—',
+            'rec_time':  rec.strftime('%H:%M:%S') if rec else '—',
+            'rec_end':   end.strftime('%H:%M:%S') if end else '—',
+        }
+
+    @property
+    def duration(self) -> float:
+        return len(self.channels[0]) / self.fs
+
+    def time_array(self) -> np.ndarray:
+        return np.arange(len(self.channels[0])) / self.fs
+
+    def segment(self, ch: int, t0: float, t1: float):
+        data = self.channels[ch]
+        s = max(0, int(t0 * self.fs))
+        e = min(len(data), int(t1 * self.fs) + 1)
+        t = np.arange(s, e) / self.fs
+        return t, data[s:e]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EDF 資料讀取（內建解析器，不需額外套件）
+# ══════════════════════════════════════════════════════════════════════════════
+class EDFData:
+    """
+    歐洲資料格式 (EDF / EDF+) 讀取器。
+    不需要外部套件，直接解析二進位格式。
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.channels: dict[int, np.ndarray] = {}
+        self._rec_datetime = None
+        self._parse()
+
+    def _parse(self):
+        with open(self.path, 'rb') as f:
+            # ── 全域標頭 (256 bytes) ──────────────────────────────────────
+            hdr = f.read(256)
+
+            startdate     = hdr[168:176].decode('ascii', errors='replace').strip()  # dd.mm.yy
+            starttime     = hdr[176:184].decode('ascii', errors='replace').strip()  # hh.mm.ss
+            n_header_bytes= int(hdr[184:192].decode('ascii', errors='replace').strip())
+            n_records     = int(hdr[236:244].decode('ascii', errors='replace').strip())
+            record_dur    = float(hdr[244:252].decode('ascii', errors='replace').strip())
+            n_signals     = int(hdr[252:256].decode('ascii', errors='replace').strip())
+
+            # 解析記錄開始時間
+            try:
+                dd, mm, yy = map(int, startdate.split('.'))
+                hh, mn, ss = map(int, starttime.split('.'))
+                year = (2000 + yy) if yy < 85 else (1900 + yy)
+                self._rec_datetime = datetime.datetime(year, mm, dd, hh, mn, ss)
+            except Exception:
+                self._rec_datetime = None
+
+            # ── 訊號標頭 (n_signals × 256 bytes) ─────────────────────────
+            sig_hdr = f.read(n_signals * 256)
+
+            def _field(size, ns=n_signals, buf=sig_hdr):
+                nonlocal _field_offset
+                out = [buf[_field_offset + i*size: _field_offset + i*size + size]
+                       .decode('ascii', errors='replace').strip()
+                       for i in range(ns)]
+                _field_offset += size * ns
+                return out
+
+            _field_offset = 0
+            labels    = _field(16)
+            _field(80)                        # transducer
+            phys_dims = _field(8)
+            phys_mins = [float(x) for x in _field(8)]
+            phys_maxs = [float(x) for x in _field(8)]
+            dig_mins  = [int(x)   for x in _field(8)]
+            dig_maxs  = [int(x)   for x in _field(8)]
+            _field(80)                        # prefilter
+            n_samp    = [int(x)   for x in _field(8)]
+
+            # 過濾掉 EDF+ 的 Annotations 通道
+            data_idx = [i for i in range(n_signals)
+                        if 'EDF Annotations' not in labels[i]]
+
+            if not data_idx:
+                raise ValueError("EDF 檔案中找不到資料通道")
+
+            # 整理通道資訊（空白或亂碼的 label 以 CH{n} 替代）
+            def _clean_label(lbl, idx):
+                cleaned = lbl.strip().replace('\x00', '').replace('?', '')
+                return cleaned if cleaned else f'CH{idx}'
+
+            self.ch_names = [_clean_label(labels[i], i) for i in data_idx]
+            self.ch_units = [phys_dims[i] if phys_dims[i] else 'mV' for i in data_idx]
+            self.n_ch     = len(data_idx)
+
+            # 取樣率（用第一個資料通道）
+            self.fs = (n_samp[data_idx[0]] / record_dur) if record_dur > 0 else 1.0
+
+            # ── 校正係數 ──────────────────────────────────────────────────
+            gains, offsets_cal = [], []
+            for i in data_idx:
+                dmin, dmax = dig_mins[i], dig_maxs[i]
+                pmin, pmax = phys_mins[i], phys_maxs[i]
+                gain = (pmax - pmin) / (dmax - dmin) if (dmax - dmin) != 0 else 1.0
+                gains.append(gain)
+                offsets_cal.append(pmin - dmin * gain)
+
+            # ── 讀取資料紀錄（一次性，用 numpy 解析加速）────────────────
+            total_samp = sum(n_samp)
+            raw_bytes  = f.read()
+
+        n_rec_avail = len(raw_bytes) // (total_samp * 2)
+        if n_rec_avail == 0:
+            raise ValueError("EDF 檔案資料區塊為空")
+
+        raw = np.frombuffer(
+            raw_bytes[:n_rec_avail * total_samp * 2],
+            dtype='<i2'
+        ).reshape(n_rec_avail, total_samp)
+
+        # 拆分各通道並做物理單位換算
+        col = 0
+        col_map = {}
+        for i in range(n_signals):
+            col_map[i] = col
+            col += n_samp[i]
+
+        for ch_new, (ch_orig, gain, off) in enumerate(zip(data_idx, gains, offsets_cal)):
+            c0 = col_map[ch_orig]
+            c1 = c0 + n_samp[ch_orig]
+            sig_raw = raw[:, c0:c1].flatten().astype(np.float64)
+            self.channels[ch_new] = sig_raw * gain + off
+
+    # ── 公用介面（與 ABFData 相同）─────────────────────────────────────────
+
+    @property
+    def rec_datetime(self):
+        return self._rec_datetime
+
+    def abs_time(self, rel_sec: float) -> str:
+        t0 = self._rec_datetime
+        if t0 is None:
+            return fmt_hms(rel_sec)
+        abs_t = t0 + datetime.timedelta(seconds=rel_sec)
+        return abs_t.strftime('%H:%M:%S.%f')[:-3]
+
+    @property
+    def duration(self) -> float:
+        if not self.channels:
+            return 0.0
+        return len(self.channels[0]) / self.fs
+
+    def time_array(self) -> np.ndarray:
+        return np.arange(len(self.channels[0])) / self.fs
+
+    def segment(self, ch: int, t0: float, t1: float):
+        data = self.channels[ch]
+        s = max(0, int(t0 * self.fs))
+        e = min(len(data), int(t1 * self.fs) + 1)
+        t = np.arange(s, e) / self.fs
+        return t, data[s:e]
+
+    def info(self) -> dict:
+        rec = self._rec_datetime
+        end = (rec + datetime.timedelta(seconds=self.duration)) if rec else None
+        return {
+            'file':      os.path.basename(self.path),
+            'fs':        self.fs,
+            'duration':  self.duration,
+            'channels':  self.n_ch,
+            'protocol':  'EDF',
+            'rec_date':  rec.strftime('%Y-%m-%d') if rec else '—',
+            'rec_time':  rec.strftime('%H:%M:%S') if rec else '—',
+            'rec_end':   end.strftime('%H:%M:%S') if end else '—',
+        }
+
+
+# ── 工廠函數：依副檔名選擇讀取器 ─────────────────────────────────────────────
+def load_ecg_file(path: str):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.edf':
+        return EDFData(path)
+    elif ext == '.abf':
+        return ABFData(path)
+    else:
+        raise ValueError(f"不支援的檔案格式：{ext}（僅支援 .abf 和 .edf）")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 濾波器工具函數
+# ══════════════════════════════════════════════════════════════════════════════
+def apply_notch(y: np.ndarray, fs: float, freq: float) -> np.ndarray:
+    if freq <= 0 or fs <= 0:
+        return y
+    nyq = fs / 2
+    if freq >= nyq:
+        return y
+    b, a = iirnotch(freq / nyq, Q=30.0)
+    return filtfilt(b, a, y)
+
+
+def apply_bandpass(y: np.ndarray, fs: float, lo_hz: float, hi_hz: float) -> np.ndarray:
+    nyq = fs / 2
+    if nyq <= 0 or lo_hz >= hi_hz:
+        return y
+    lo = max(lo_hz / nyq, 1e-4)
+    hi = min(hi_hz / nyq, 0.9999)
+    if lo >= hi:
+        return y
+    b, a = butter(3, [lo, hi], btype='band')
+    return filtfilt(b, a, y)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# R-peak 偵測（共用邏輯，供背景執行緒與測量範圍 BPM 共用）
+# ══════════════════════════════════════════════════════════════════════════════
+def detect_r_peaks_and_stats(data: np.ndarray, fs: float,
+                              notch_freq: float = 0.0,
+                              bp_enabled: bool = False,
+                              bp_lo: float = 1.0, bp_hi: float = 150.0):
+    """偵測 R-peak 並計算 RR/HR 統計。回傳 (peaks, stats)；資料不足時 stats 為 {}。"""
+    # notch filter（先做，避免電源雜訊干擾），保留一份供之後定位精修使用
+    raw = data
+    if notch_freq > 0:
+        raw = apply_notch(raw, fs, notch_freq)
+
+    # bandpass: use user-defined range if enabled, else default 5–150 Hz
+    # （此頻帶濾波僅用來讓「粗略」峰值偵測更穩定；帶通會把很尖銳的
+    #   needle 訊號抹平，因此實際峰值位置之後會在原始訊號中重新精修）
+    lo_hz = bp_lo if bp_enabled else 5.0
+    hi_hz = bp_hi if bp_enabled else 150.0
+    nyq = fs / 2
+    lo = max(lo_hz / nyq, 1e-4)
+    hi = min(hi_hz / nyq, 0.98)
+    if lo < hi:
+        b, a = butter(3, [lo, hi], btype='band')
+        filt = filtfilt(b, a, raw)
+    else:
+        filt = raw.copy()
+
+    thresh = np.percentile(filt, 88)
+    flipped = False
+    if thresh <= 0:
+        filt = -filt
+        flipped = True
+        thresh = np.percentile(filt, 88)
+
+    # min_dist 只是用來避免同一個 QRS/spike 的抖動或 overshoot 被誤算成
+    # 兩拍，跟「兩次真正心跳最少要間隔多久」無關，所以只需比單一個尖峰
+    # 波形本身的寬度稍大即可。用太大的值（例如假設最快心跳 460 bpm）在
+    # 心跳很快、很規律的資料上，會讓 find_peaks 自己的 distance 限制
+    # 把兩個都合法、只是間距較近的真實峰值直接刪掉一個。這裡改用較保守
+    # 的下限（約對應 1000 bpm），只防止單一尖峰內的雜訊重複偵測。
+    min_dist = max(5, int(fs * 0.06))
+    peaks, _ = find_peaks(filt, height=thresh * 0.65, distance=min_dist)
+
+    # ── 排除較弱的假峰值（例如 T 波／隆起波形）────────────────────────────
+    # 縮小 min_dist 後，QRS 之間較弱的隆起波形有機會因為離兩側真正的
+    # R-peak 都超過 min_dist，而被單獨偵測成一個多餘的峰值。真正的
+    # R-peak 彼此振幅通常相當接近，明顯比雜訊/T 波矮很多，所以用候選
+    # 峰值本身振幅的中位數做一個相對門檻，把明顯偏矮的候選點濾掉。
+    if len(peaks) >= 3:
+        heights = filt[peaks]
+        med_h = np.median(heights)
+        peaks = peaks[heights >= med_h * 0.5]
+
+    # ── 峰值定位精修 ──────────────────────────────────────────────────────
+    # 帶通濾波後找到的位置只是「粗略」位置，尖銳的 needle 訊號常被濾波
+    # 平滑掉，導致峰值誤定位到旁邊較寬的隆起波形。這裡在「原始（僅濾除
+    # 電源雜訊，未經頻帶平滑）」訊號中，於每個粗略峰值自己的區間內
+    # （以與左右相鄰峰值的中點為界，避免誤跨到別拍）尋找振幅真正最大的
+    # 樣本點，把峰值精確定位到該點上。
+    if len(peaks) > 0:
+        sign = -1.0 if flipped else 1.0
+        n = len(raw)
+        # 第一拍／最後一拍沒有左右相鄰峰值可以取中點，改用資料本身估計
+        # 出的典型拍間距（其餘峰值間距的中位數）當作搜尋範圍，找不到就
+        # 退回較大的固定值，避免範圍太小而搜尋不到真正的尖峰。
+        if len(peaks) > 1:
+            edge_span = max(min_dist, int(np.median(np.diff(peaks)) * 0.9))
+        else:
+            edge_span = max(min_dist, int(fs * 0.2))
+        refined = []
+        for i, p in enumerate(peaks):
+            lo_b = (peaks[i - 1] + p) // 2 if i > 0 else max(0, p - edge_span)
+            hi_b = (p + peaks[i + 1]) // 2 if i < len(peaks) - 1 else min(n - 1, p + edge_span)
+            lo_b = max(0, min(int(lo_b), n - 1))
+            hi_b = max(lo_b + 1, min(int(hi_b) + 1, n))
+            local = raw[lo_b:hi_b] * sign
+            refined.append(lo_b + int(np.argmax(local)))
+
+        # 註：每個精修區間都以左右相鄰「粗略」峰值的中點為界，區間彼此
+        # 不重疊，因此不會有兩個精修後的點落在同一個區間內；這裡只需去除
+        # 完全相同索引的邊界情況即可，不應再用 min_dist 做二次合併──
+        # 真實心跳間距可能非常接近甚至小於 min_dist（例如快速心律），
+        # 用 min_dist 二次過濾會把相鄰的真實 R-peak 誤刪。
+        peaks = np.array(sorted(set(refined)))
+
+    stats = rr_stats_from_peaks(peaks, fs)
+    return peaks, stats
+
+
+def rr_stats_from_peaks(peaks: np.ndarray, fs: float) -> dict:
+    """從一組 R-peak 樣本索引計算 RR/HR 統計。供自動偵測與手動編輯共用。"""
+    if peaks is None or len(peaks) < 2:
+        return {}
+    rr = np.diff(np.sort(peaks)) / fs * 1000
+    rr = rr[(rr > 80) & (rr < 2000)]
+    if len(rr) == 0:
+        return {}
+    return {
+        'count':   len(peaks),
+        'hr':      round(60000 / rr.mean(), 1),
+        'rr_mean': round(rr.mean(), 1),
+        'rr_std':  round(rr.std(), 1),
+        'rmssd':   round(float(np.sqrt(np.mean(np.diff(rr) ** 2))), 1) if len(rr) > 1 else 0,
+        'cv':      round(rr.std() / rr.mean() * 100, 1),
+    }
+
+
+def rr_stats_from_times(times) -> dict:
+    """跟 rr_stats_from_peaks 相同，但直接吃『秒』為單位的時間陣列
+    （例如已換算成絕對時間的 R-peak 標記），給測量範圍 BPM 沿用既有
+    標記時使用。"""
+    times = np.sort(np.asarray(times, dtype=float))
+    if len(times) < 2:
+        return {}
+    rr = np.diff(times) * 1000
+    rr = rr[(rr > 80) & (rr < 2000)]
+    if len(rr) == 0:
+        return {}
+    return {
+        'count':   len(times),
+        'hr':      round(60000 / rr.mean(), 1),
+        'rr_mean': round(rr.mean(), 1),
+        'rr_std':  round(rr.std(), 1),
+        'rmssd':   round(float(np.sqrt(np.mean(np.diff(rr) ** 2))), 1) if len(rr) > 1 else 0,
+        'cv':      round(rr.std() / rr.mean() * 100, 1),
+    }
+
+
+class PeakDetector(QThread):
+    finished = pyqtSignal(object, object)   # peaks, stats
+
+    def __init__(self, data: np.ndarray, fs: float, t_offset: float,
+                 notch_freq: float = 0.0,
+                 bp_enabled: bool = False, bp_lo: float = 1.0, bp_hi: float = 150.0):
+        super().__init__()
+        self.data = data
+        self.fs = fs
+        self.t_offset = t_offset
+        self.notch_freq = notch_freq
+        self.bp_enabled = bp_enabled
+        self.bp_lo = bp_lo
+        self.bp_hi = bp_hi
+
+    def run(self):
+        try:
+            peaks, stats = detect_r_peaks_and_stats(
+                self.data, self.fs,
+                notch_freq=self.notch_freq,
+                bp_enabled=self.bp_enabled,
+                bp_lo=self.bp_lo, bp_hi=self.bp_hi)
+            self.finished.emit(peaks, stats)
+        except Exception:
+            self.finished.emit(np.array([]), {})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 時間戳記管理
+# ══════════════════════════════════════════════════════════════════════════════
+class TimestampManager:
+    def __init__(self, abf_path: str):
+        base = os.path.splitext(abf_path)[0]
+        self.json_path = base + '_timestamps.json'
+        self.csv_path  = base + '_timestamps.csv'
+        self.records: list[dict] = []
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.json_path):
+            try:
+                with open(self.json_path, encoding='utf-8') as f:
+                    self.records = json.load(f)
+            except Exception:
+                self.records = []
+
+    def add(self, t_start: float, t_end: float | None,
+            label: str = '', note: str = '', tag: str = '',
+            ecg_data=None) -> dict:
+        abs_start = ecg_data.abs_time(t_start) if ecg_data else ''
+        abs_end   = ecg_data.abs_time(t_end)   if (ecg_data and t_end is not None) else ''
+        rec_date  = ecg_data.rec_datetime.strftime('%Y-%m-%d') if (ecg_data and ecg_data.rec_datetime) else ''
+        rec = {
+            'id':           len(self.records) + 1,
+            'created':      datetime.datetime.now().isoformat(timespec='seconds'),
+            'label':        label or f'TS-{len(self.records)+1:03d}',
+            'tag':          tag,
+            'note':         note,
+            'rec_date':     rec_date,
+            't_start':      round(t_start, 4),
+            't_end':        round(t_end, 4) if t_end is not None else None,
+            'duration':     round(t_end - t_start, 4) if t_end is not None else None,
+            't_start_hms':  fmt_hms(t_start),
+            't_end_hms':    fmt_hms(t_end) if t_end is not None else '',
+            'abs_start':    abs_start,
+            'abs_end':      abs_end,
+        }
+        self.records.append(rec)
+        self.save()
+        return rec
+
+    def remove(self, idx: int):
+        if 0 <= idx < len(self.records):
+            self.records.pop(idx)
+            # 重新編號
+            for i, r in enumerate(self.records):
+                r['id'] = i + 1
+            self.save()
+
+    def save(self):
+        with open(self.json_path, 'w', encoding='utf-8') as f:
+            json.dump(self.records, f, ensure_ascii=False, indent=2)
+        if self.records:
+            keys = ['id','created','label','tag','note','rec_date',
+                    't_start','t_end','duration','t_start_hms','t_end_hms',
+                    'abs_start','abs_end']
+            with open(self.csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+                w = csv.DictWriter(f, fieldnames=keys, extrasaction='ignore')
+                w.writeheader()
+                w.writerows(self.records)
+
+    def update(self, idx: int, label: str, note: str, tag: str):
+        if 0 <= idx < len(self.records):
+            self.records[idx]['label'] = label
+            self.records[idx]['note']  = note
+            self.records[idx]['tag']   = tag
+            self.save()
+
+    @property
+    def save_dir(self):
+        return os.path.dirname(self.json_path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 右側面板：資訊 + 時間戳記
+# ══════════════════════════════════════════════════════════════════════════════
+class SidePanel(QWidget):
+    ts_selected   = pyqtSignal(int)      # 選中某筆 timestamp
+    ts_deleted    = pyqtSignal(list)     # 刪除多筆 timestamp（index 列表）
+    ts_renamed    = pyqtSignal(int, str, str, str)  # 編輯（index, label, note, tag）
+    ts_goto       = pyqtSignal(float)    # 跳到指定時間
+    ts_save_requested = pyqtSignal()     # 觸發儲存時間戳記
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumWidth(240)
+        self.setMaximumWidth(320)
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        # ── 檔案資訊 ──
+        grp_info = QGroupBox("檔案資訊")
+        info_lay = QVBoxLayout(grp_info)
+        info_lay.setSpacing(3)
+
+        self.lbl_file      = self._kv('檔案', '—')
+        self.lbl_fs        = self._kv('取樣率', '—')
+        self.lbl_dur       = self._kv('總長度', '—')
+        self.lbl_ch        = self._kv('通道數', '—')
+        self.lbl_rec_date  = self._kv('記錄日期', '—')
+        self.lbl_rec_start = self._kv('開始時間', '—')
+        self.lbl_rec_end   = self._kv('結束時間', '—')
+
+        for w in [self.lbl_file, self.lbl_fs, self.lbl_dur, self.lbl_ch,
+                  self.lbl_rec_date, self.lbl_rec_start, self.lbl_rec_end]:
+            info_lay.addWidget(w)
+        lay.addWidget(grp_info)
+
+        # ── 目前視窗 ──
+        grp_view = QGroupBox("目前視窗")
+        view_lay = QVBoxLayout(grp_view)
+        view_lay.setSpacing(3)
+        self.lbl_view_start = self._kv('起點', '—')
+        self.lbl_view_end   = self._kv('終點', '—')
+        self.lbl_view_win   = self._kv('視窗', '—')
+        for w in [self.lbl_view_start, self.lbl_view_end, self.lbl_view_win]:
+            view_lay.addWidget(w)
+        lay.addWidget(grp_view)
+
+        # ── 測量結果 ──
+        grp_meas = QGroupBox("時間測量")
+        meas_lay = QVBoxLayout(grp_meas)
+        meas_lay.setSpacing(3)
+        self.lbl_pt_a    = self._kv('A點', '—')
+        self.lbl_pt_b    = self._kv('B點', '—')
+        self.lbl_delta   = self._kv('Δt', '—')
+        self.lbl_delta_ms= self._kv('Δt (ms)', '—')
+        self.lbl_bpm     = self._kv('平均 BPM', '—')
+        for w in [self.lbl_pt_a, self.lbl_pt_b, self.lbl_delta, self.lbl_delta_ms, self.lbl_bpm]:
+            meas_lay.addWidget(w)
+        lay.addWidget(grp_meas)
+
+        # ── RR 統計 ──
+        grp_rr = QGroupBox("節律分析")
+        rr_lay = QVBoxLayout(grp_rr)
+        rr_lay.setSpacing(3)
+        self.lbl_hr     = self._kv('心率', '—')
+        self.lbl_rr     = self._kv('RR 間距', '—')
+        self.lbl_rmssd  = self._kv('RMSSD', '—')
+        self.lbl_cv     = self._kv('CV%', '—')
+        for w in [self.lbl_hr, self.lbl_rr, self.lbl_rmssd, self.lbl_cv]:
+            rr_lay.addWidget(w)
+        lay.addWidget(grp_rr)
+
+        # ── 時間戳記列表 ──
+        grp_ts = QGroupBox("時間戳記")
+        ts_lay = QVBoxLayout(grp_ts)
+        ts_lay.setSpacing(4)
+
+        # 儲存時間戳記按鈕（移到側邊欄）
+        self.btn_save_ts = QPushButton("+ 儲存時間戳記  (T)")
+        self.btn_save_ts.setObjectName('btn_success')
+        self.btn_save_ts.clicked.connect(lambda: self.ts_save_requested.emit())
+        ts_lay.addWidget(self.btn_save_ts)
+
+        self.ts_list = QListWidget()
+        self.ts_list.setMinimumHeight(100)
+        self.ts_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.ts_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.ts_list.customContextMenuRequested.connect(self._on_ts_context_menu)
+        self.ts_list.itemClicked.connect(self._on_ts_click)
+        self.ts_list.itemDoubleClicked.connect(self._on_ts_goto)
+        ts_lay.addWidget(self.ts_list)
+
+        btn_row = QHBoxLayout()
+        self.btn_del_ts = QPushButton("刪除選取")
+        self.btn_del_ts.setObjectName('btn_danger')
+        self.btn_del_ts.clicked.connect(self._on_ts_delete)
+        btn_row.addWidget(self.btn_del_ts)
+
+        self.btn_open_folder = QPushButton("開啟資料夾")
+        self.btn_open_folder.clicked.connect(self._on_open_folder)
+        btn_row.addWidget(self.btn_open_folder)
+        ts_lay.addLayout(btn_row)
+
+        # AFib 加總
+        div = QFrame()
+        div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet(f'color:{C["border"]};')
+        ts_lay.addWidget(div)
+
+        def _afib_lbl(text):
+            lbl = QLabel(text)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setWordWrap(True)
+            return lbl
+
+        self.lbl_afib = _afib_lbl(
+            f'<span style="color:{C["dim"]}">AFib 總時長：</span>'
+            f'<span style="color:{C["purple"]}; font-weight:bold;">—</span>')
+        self.lbl_afib_baseline = _afib_lbl(
+            f'<span style="color:{C["dim"]}">AFib (Baseline)：</span>'
+            f'<span style="color:{C["purple"]}; font-weight:bold;">—</span>')
+        self.lbl_afib_apamin = _afib_lbl(
+            f'<span style="color:{C["dim"]}">AFib (Apamin)：</span>'
+            f'<span style="color:{C["purple"]}; font-weight:bold;">—</span>')
+        ts_lay.addWidget(self.lbl_afib)
+        ts_lay.addWidget(self.lbl_afib_baseline)
+        ts_lay.addWidget(self.lbl_afib_apamin)
+
+        lay.addWidget(grp_ts)
+        lay.addStretch()
+
+        self._ts_manager = None
+
+    def _kv(self, key: str, val: str) -> QLabel:
+        lbl = QLabel(f'<span style="color:{C["dim"]}">{key}：</span>'
+                     f'<span style="color:{C["accent"]}">{val}</span>')
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setWordWrap(True)
+        return lbl
+
+    def _set_kv(self, lbl: QLabel, key: str, val: str):
+        lbl.setText(f'<span style="color:{C["dim"]}">{key}：</span>'
+                    f'<span style="color:{C["accent"]}">{val}</span>')
+
+    def update_file_info(self, data):
+        name = os.path.basename(data.path)
+        name = name if len(name) <= 20 else '…' + name[-17:]
+        ext  = os.path.splitext(data.path)[1].upper().lstrip('.')
+        self._set_kv(self.lbl_file, '檔案', name)
+        self._set_kv(self.lbl_fs,   '取樣率', f'{data.fs:,.0f} Hz')
+        self._set_kv(self.lbl_dur,  '總長度', fmt_hms(data.duration))
+        self._set_kv(self.lbl_ch,   '通道數', f'{data.n_ch}  [{ext}]')
+
+    def update_view(self, t0: float, t1: float):
+        self._set_kv(self.lbl_view_start, '起點', fmt_hms(t0))
+        self._set_kv(self.lbl_view_end,   '終點', fmt_hms(t1))
+        self._set_kv(self.lbl_view_win,   '視窗', f'{t1-t0:.3f} s')
+        if hasattr(self, '_ecg_data_ref') and self._ecg_data_ref is not None:
+            self._set_kv(self.lbl_view_start, '起點',
+                f'{fmt_hms(t0)}  ({self._ecg_data_ref.abs_time(t0)})')
+            self._set_kv(self.lbl_view_end, '終點',
+                f'{fmt_hms(t1)}  ({self._ecg_data_ref.abs_time(t1)})')
+
+    def update_measure(self, pts: list, bpm_info: dict | None = None):
+        a = pts[0] if len(pts) > 0 else None
+        b = pts[1] if len(pts) > 1 else None
+        self._set_kv(self.lbl_pt_a, 'A點', fmt_hms(a) if a is not None else '—（點擊波形）')
+        self._set_kv(self.lbl_pt_b, 'B點', fmt_hms(b) if b is not None else '—（再次點擊）')
+        if a is not None and b is not None:
+            dt = abs(b - a)
+            self._set_kv(self.lbl_delta,    'Δt', f'{dt:.4f} s')
+            self._set_kv(self.lbl_delta_ms, 'Δt(ms)', f'{dt*1000:.2f} ms')
+        else:
+            self._set_kv(self.lbl_delta,    'Δt', '—')
+            self._set_kv(self.lbl_delta_ms, 'Δt(ms)', '—')
+
+        if not bpm_info:
+            self._set_kv(self.lbl_bpm, '平均 BPM', '—')
+        elif bpm_info.get('skipped'):
+            self._set_kv(self.lbl_bpm, '平均 BPM', '範圍過大，請改用 P 偵測')
+        elif bpm_info.get('hr') is not None:
+            self._set_kv(self.lbl_bpm, '平均 BPM',
+                         f"{bpm_info['hr']}（{bpm_info.get('count', '—')} 個 R-peak）")
+        elif bpm_info.get('count', 0) > 0:
+            self._set_kv(self.lbl_bpm, '平均 BPM', f"僅偵測到 {bpm_info['count']} 個峰值，不足以計算")
+        else:
+            self._set_kv(self.lbl_bpm, '平均 BPM', '—（範圍內未偵測到 R-peak）')
+
+    def update_rr(self, stats: dict):
+        if not stats:
+            for lbl, k in [(self.lbl_hr,'心率'),(self.lbl_rr,'RR間距'),
+                           (self.lbl_rmssd,'RMSSD'),(self.lbl_cv,'CV%')]:
+                self._set_kv(lbl, k, '—')
+            return
+        self._set_kv(self.lbl_hr,    '心率',   f"{stats.get('hr','—')} bpm")
+        self._set_kv(self.lbl_rr,    'RR間距', f"{stats.get('rr_mean','—')}±{stats.get('rr_std','—')} ms")
+        self._set_kv(self.lbl_rmssd, 'RMSSD',  f"{stats.get('rmssd','—')} ms")
+        self._set_kv(self.lbl_cv,    'CV%',    f"{stats.get('cv','—')} %")
+
+    def set_ecg_data(self, data):
+        self._ecg_data_ref = data
+
+    def set_ts_manager(self, mgr: TimestampManager):
+        self._ts_manager = mgr
+        self.refresh_ts_list()
+
+    def refresh_ts_list(self):
+        self.ts_list.clear()
+        self._reset_afib_labels()
+        if not self._ts_manager:
+            return
+        totals = {'AFib': 0.0, 'AFib (Baseline)': 0.0, 'AFib (Apamin)': 0.0}
+        for r in self._ts_manager.records:
+            dur = f"Δ{r['duration']:.3f}s" if r['duration'] else '(點)'
+            tag = r.get('tag', '')
+            tag_str = f'  [{tag}]' if tag else ''
+            t_disp = r.get('abs_start') or r['t_start_hms']
+            item = QListWidgetItem(
+                f"#{r['id']:02d}  {r['label']}{tag_str}\n"
+                f"     {t_disp}  {dur}\n"
+                f"     {r['note'][:30] if r['note'] else ''}"
+            )
+            if tag in totals:
+                item.setForeground(QColor(C['purple']))
+                if r.get('duration') is not None:
+                    totals[tag] += r['duration']
+            else:
+                item.setForeground(QColor(C['text']))
+            self.ts_list.addItem(item)
+
+        grand = totals['AFib'] + totals['AFib (Baseline)'] + totals['AFib (Apamin)']
+        self._set_afib_lbl(self.lbl_afib,          'AFib 總時長',     grand)
+        self._set_afib_lbl(self.lbl_afib_baseline,  'AFib (Baseline)', totals['AFib (Baseline)'])
+        self._set_afib_lbl(self.lbl_afib_apamin,    'AFib (Apamin)',   totals['AFib (Apamin)'])
+
+    def _set_afib_lbl(self, lbl: QLabel, key: str, sec: float):
+        if sec > 0:
+            lbl.setText(
+                f'<span style="color:{C["dim"]}">{key}：</span>'
+                f'<span style="color:{C["purple"]}; font-weight:bold;">'
+                f'{fmt_hms(sec)}  ({sec:.2f} s)</span>')
+        else:
+            lbl.setText(
+                f'<span style="color:{C["dim"]}">{key}：</span>'
+                f'<span style="color:{C["purple"]}; font-weight:bold;">—</span>')
+
+    def _reset_afib_labels(self):
+        for lbl, key in [
+            (self.lbl_afib,          'AFib 總時長'),
+            (self.lbl_afib_baseline, 'AFib (Baseline)'),
+            (self.lbl_afib_apamin,   'AFib (Apamin)'),
+        ]:
+            lbl.setText(
+                f'<span style="color:{C["dim"]}">{key}：</span>'
+                f'<span style="color:{C["purple"]}; font-weight:bold;">—</span>')
+
+    def _on_ts_click(self, item):
+        idx = self.ts_list.row(item)
+        self.ts_selected.emit(idx)
+
+    def _on_ts_goto(self, item):
+        idx = self.ts_list.row(item)
+        if self._ts_manager and 0 <= idx < len(self._ts_manager.records):
+            t = self._ts_manager.records[idx]['t_start']
+            self.ts_goto.emit(t)
+
+    def _on_ts_delete(self):
+        indices = sorted([self.ts_list.row(item)
+                          for item in self.ts_list.selectedItems()], reverse=True)
+        if indices:
+            self.ts_deleted.emit(indices)
+
+    def _on_ts_context_menu(self, pos):
+        item = self.ts_list.itemAt(pos)
+        if item is None:
+            return
+        idx = self.ts_list.row(item)
+
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f'QMenu{{background:{C["panel"]};border:1px solid {C["border"]};'
+            f'color:{C["text"]};font-size:12px;}}'
+            f'QMenu::item:selected{{background:{C["accent"]};color:{C["bg"]};}}')
+
+        act_rename = menu.addAction('✏️  修改名稱')
+        act_delete = menu.addAction('🗑  刪除')
+
+        chosen = menu.exec(self.ts_list.viewport().mapToGlobal(pos))
+        if chosen == act_rename:
+            self._do_rename(idx)
+        elif chosen == act_delete:
+            self.ts_deleted.emit([idx])
+
+    def _do_rename(self, idx: int):
+        if not self._ts_manager or idx >= len(self._ts_manager.records):
+            return
+        rec = self._ts_manager.records[idx]
+        dlg = TimestampDialog(
+            rec['t_start'], rec.get('t_end'),
+            parent=self,
+            init_label=rec.get('label', ''),
+            init_note=rec.get('note', ''),
+            init_tag=rec.get('tag', ''),
+            edit_mode=True)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            label, note, tag = dlg.get_data()
+            self.ts_renamed.emit(idx, label, note, tag)
+
+    def _on_open_folder(self):
+        if self._ts_manager:
+            import subprocess
+            path = self._ts_manager.save_dir
+            if sys.platform == 'darwin':
+                subprocess.run(['open', path])
+            elif sys.platform.startswith('win'):
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                subprocess.run(['xdg-open', path])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 時間戳記儲存對話框
+# ══════════════════════════════════════════════════════════════════════════════
+class TimestampDialog(QDialog):
+    def __init__(self, t_start: float, t_end: float | None, parent=None,
+                 init_label: str = '', init_note: str = '', init_tag: str = '',
+                 edit_mode: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle('修改時間戳記' if edit_mode else '新增時間戳記')
+        self.setModal(True)
+        self.setMinimumWidth(360)
+        self.t_start    = t_start
+        self.t_end      = t_end
+        self.init_label = init_label
+        self.init_note  = init_note
+        self.init_tag   = init_tag
+        self.edit_mode  = edit_mode
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+
+        # 時間資訊
+        grp = QGroupBox('時間範圍')
+        g_lay = QVBoxLayout(grp)
+        if self.t_end is not None:
+            dt = abs(self.t_end - self.t_start)
+            info = (f"起點：{fmt_hms(self.t_start)}\n"
+                    f"終點：{fmt_hms(self.t_end)}\n"
+                    f"時間長：{dt:.4f} s  ({dt*1000:.2f} ms)")
+        else:
+            info = f"時間點：{fmt_hms(self.t_start)}"
+        lbl = QLabel(info)
+        lbl.setStyleSheet(f'color: {C["accent"]}; font-size: 13px;')
+        g_lay.addWidget(lbl)
+        lay.addWidget(grp)
+
+        # 類型標籤（快速選擇）
+        lay.addWidget(QLabel('類型標籤：'))
+        self.combo_tag = QComboBox()
+        self.combo_tag.addItems(['', 'AFib', 'AFib (Baseline)', 'AFib (Apamin)', 'Pacing', 'Tachycardia', 'Bradycardia', 'VF', '其他'])
+        self.combo_tag.setStyleSheet(
+            f'QComboBox{{background:{C["panel"]};color:{C["purple"]};'
+            f'border:1px solid {C["border"]};border-radius:5px;'
+            f'padding:4px 8px;font-size:12px;}}'
+            f'QComboBox::drop-down{{border:none;}}')
+        self.combo_tag.currentTextChanged.connect(self._on_tag_changed)
+        # 預填 tag
+        idx = self.combo_tag.findText(self.init_tag)
+        if idx >= 0:
+            self.combo_tag.setCurrentIndex(idx)
+        lay.addWidget(self.combo_tag)
+
+        # 標籤
+        lay.addWidget(QLabel('標籤名稱：'))
+        self.edit_label = QLineEdit()
+        self.edit_label.setPlaceholderText('例如：AFib onset / Pacing / 心搏過速...')
+        self.edit_label.setText(self.init_label)
+        lay.addWidget(self.edit_label)
+
+        # 備註
+        lay.addWidget(QLabel('備註（可留空）：'))
+        self.edit_note = QLineEdit()
+        self.edit_note.setPlaceholderText('補充說明...')
+        self.edit_note.setText(self.init_note)
+        lay.addWidget(self.edit_note)
+
+        # 按鈕
+        btn_row = QHBoxLayout()
+        btn_ok = QPushButton('✅ 儲存變更' if self.edit_mode else '✅ 儲存時間戳記')
+        btn_ok.setObjectName('btn_success')
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton('取消')
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        lay.addLayout(btn_row)
+
+    def _on_tag_changed(self, tag: str):
+        if tag and not self.edit_label.text().strip() and not self.edit_mode:
+            self.edit_label.setText(tag)
+
+    def get_data(self):
+        return self.edit_label.text().strip(), self.edit_note.text().strip(), self.combo_tag.currentText()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Excel 實驗記錄匯入
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fmt_event_label(action, cl, srp) -> str:
+    action = str(action or '').strip()
+    if action.lower().startswith('a '):
+        action = action[2:]
+    label = action
+    if cl is not None:
+        label += f' {cl}'
+    if str(srp or '').strip().lower() == 'p':
+        label += 'p'
+    return label.strip()
+
+
+def parse_domap(xlsx_path: str) -> list[dict]:
+    """解析 dOMAP 分頁，回傳所有有 OMAP# 的事件列表。"""
+    try:
+        import openpyxl
+    except ImportError:
+        raise ImportError('請先安裝 openpyxl：pip3 install openpyxl')
+
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    if 'dOMAP' not in wb.sheetnames:
+        raise ValueError("找不到 'dOMAP' 分頁，請確認 Excel 檔案格式")
+
+    ws = wb['dOMAP']
+    all_rows = list(ws.iter_rows(values_only=True))
+
+    # 預先解析每列的時間字串（None 表示該列無時間值）
+    row_times = []
+    for row in all_rows:
+        time_val = row[0] if len(row) > 0 else None
+        if time_val is not None:
+            try:
+                row_times.append(str(int(float(str(time_val)))).zfill(4))
+            except (ValueError, TypeError):
+                row_times.append(None)
+        else:
+            row_times.append(None)
+
+    events = []
+
+    for i, row in enumerate(all_rows):
+        omap_no  = row[1] if len(row) > 1 else None
+        action   = row[2] if len(row) > 2 else None
+        cl       = row[3] if len(row) > 3 else None
+        srp      = row[4] if len(row) > 4 else None
+        note_val = row[5] if len(row) > 5 else None
+
+        # 只保留有 OMAP# 且為數字、且 Action 為 'SR' 的列
+        if omap_no is None:
+            continue
+        omap_str = str(omap_no).strip()
+        if not omap_str or not omap_str.isdigit():
+            continue
+        if str(action or '').strip() != 'SR':
+            continue
+
+        # 找 SR 行下方最近的時間戳記
+        next_time_str = None
+        for j in range(i + 1, len(all_rows)):
+            if row_times[j] is not None:
+                next_time_str = row_times[j]
+                break
+
+        label = _fmt_event_label(action, cl, srp)
+        if not label:
+            label = f'#{omap_str}'
+
+        events.append({
+            'omap_no':  omap_str,
+            'time_str': next_time_str,
+            'label':    label,
+            'note':     str(note_val or '').strip(),
+        })
+
+    return events
+
+
+class ExcelImportDialog(QDialog):
+    def __init__(self, events: list[dict], ecg_data, parent=None):
+        super().__init__(parent)
+        self.events   = events
+        self.abf_data = ecg_data   # 保持內部命名相容
+        self.resolved = []
+        self.setWindowTitle('匯入實驗記錄')
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(420)
+        self._resolve()
+        self._build()
+
+    def _resolve(self):
+        import datetime as dt
+        t0  = self.abf_data.rec_datetime if self.abf_data else None
+        dur = self.abf_data.duration     if self.abf_data else None
+
+        for ev in self.events:
+            ts       = ev['time_str']
+            t_sec    = None
+            abs_str  = '—'
+            warn     = ''
+
+            if not t0:
+                warn = '⚠ ABF 無時間'
+            elif not ts or len(ts) < 4:
+                warn = '⚠ 無時間資訊'
+            else:
+                try:
+                    h = int(ts[:2]);  m = int(ts[2:4])
+                    target  = t0.replace(hour=h, minute=m, second=0, microsecond=0)
+                    if target < t0:
+                        target += dt.timedelta(days=1)
+                    abs_str = target.strftime('%H:%M:%S')
+                    t_sec   = (target - t0).total_seconds()
+                    if dur and not (0 <= t_sec <= dur):
+                        warn  = '⚠ 超出錄音範圍'
+                        t_sec = max(0.0, min(dur, t_sec))
+                except Exception:
+                    warn = '⚠ 時間解析失敗'
+
+            self.resolved.append({**ev, 't_sec': t_sec, 'abs_str': abs_str, 'warn': warn})
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
+        lay.setContentsMargins(12, 12, 12, 12)
+
+        t0        = self.abf_data.rec_datetime if self.abf_data else None
+        t0_str    = t0.strftime('%H:%M:%S') if t0 else '（無時間資訊）'
+        valid_cnt = sum(1 for r in self.resolved if r['t_sec'] is not None)
+
+        lbl_info = QLabel(
+            f'ABF 錄音開始：<b style="color:{C["accent"]}">{t0_str}</b>　　'
+            f'找到 <b>{len(self.resolved)}</b> 筆事件，'
+            f'<b style="color:{C["green"]}">{valid_cnt}</b> 筆可匯入')
+        lbl_info.setTextFormat(Qt.TextFormat.RichText)
+        lbl_info.setStyleSheet(f'color:{C["text"]}; font-size:12px;')
+        lay.addWidget(lbl_info)
+
+        self.list_w = QListWidget()
+        self.list_w.setMinimumHeight(280)
+        self.list_w.setStyleSheet(
+            f'QListWidget{{background:{C["panel"]};border:1px solid {C["border"]};'
+            f'border-radius:6px;font-size:11px;}}'
+            f'QListWidget::item{{padding:3px 6px;}}'
+            f'QListWidget::item:selected{{background:{C["accent"]};color:{C["bg"]}}}')
+
+        for r in self.resolved:
+            text = (f"#{r['omap_no']}  {r['abs_str']}"
+                    f"  |  {r['label']}")
+            if r['note']:
+                text += f"  ({r['note']})"
+            if r['warn']:
+                text += f"  {r['warn']}"
+            item = QListWidgetItem(text)
+            if r['t_sec'] is None:
+                item.setForeground(QColor(C['dim']))
+            elif r['warn']:
+                item.setForeground(QColor(C['yellow']))
+            else:
+                item.setForeground(QColor(C['text']))
+            self.list_w.addItem(item)
+
+        lay.addWidget(self.list_w)
+
+        lbl_note = QLabel('灰色項目（無時間或超出範圍）不會被匯入')
+        lbl_note.setStyleSheet(f'color:{C["dim"]}; font-size:11px;')
+        lay.addWidget(lbl_note)
+
+        btn_row = QHBoxLayout()
+        btn_ok = QPushButton(f'✅ 匯入 {valid_cnt} 筆時間戳記')
+        btn_ok.setObjectName('btn_success')
+        btn_ok.setEnabled(valid_cnt > 0)
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel = QPushButton('取消')
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        lay.addLayout(btn_row)
+
+    def get_valid_events(self):
+        return [r for r in self.resolved if r['t_sec'] is not None]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 波形顯示區
+# ══════════════════════════════════════════════════════════════════════════════
+class WaveformWidget(QWidget):
+    measure_updated = pyqtSignal(list)     # 傳出測量點列表
+    view_changed    = pyqtSignal(float, float)
+    peaks_edited    = pyqtSignal(object, dict)   # 手動新增/刪除 R-peak 後：peaks, stats
+
+    def __init__(self):
+        super().__init__()
+        self.data = None   # ABFData | EDFData
+        self.ch_idx   = 0
+        self.t_start  = 0.0
+        self.t_end    = 10.0
+        self.measure_mode = False
+        self.measure_pts  = []      # [t_a, t_b]
+        self.peak_edit_mode = False
+        self.line_a: InfiniteLine | None = None
+        self._peaks_cache    = None
+        self._ts_items_cache = []
+        self.y_scale         = 1.0
+        self._y_auto         = True
+        self.dual_mode       = True    # 預設雙通道顯示
+        self.ch_idx2         = 1          # 第二軌道通道索引
+        self._drawing        = False      # 防止重入
+        self.notch_freq      = 0.0        # 工頻陷波：0=關閉, 50=50 Hz, 60=60 Hz
+        self.bp_enabled      = False      # 帶通濾波器啟用
+        self.bp_lo           = 1.0        # 帶通下限 Hz
+        self.bp_hi           = 150.0      # 帶通上限 Hz
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+
+        # ── CH0 header row ──
+        hdr0 = QHBoxLayout()
+        hdr0.setContentsMargins(0, 2, 0, 0)
+        lbl_ch0 = QLabel('軌道 1：')
+        lbl_ch0.setStyleSheet(f'color:{C["dim"]}; font-size:11px;')
+        hdr0.addWidget(lbl_ch0)
+        self.combo_ch0 = QComboBox()
+        self.combo_ch0.setMinimumWidth(130)
+        self.combo_ch0.setMaximumHeight(22)
+        self.combo_ch0.setStyleSheet(
+            f'QComboBox{{background:{C["panel"]};color:{C["accent"]};'
+            f'border:1px solid {C["border"]};border-radius:4px;'
+            f'padding:1px 6px;font-size:11px;}}'
+            f'QComboBox::drop-down{{border:none;}}')
+        self.combo_ch0.currentIndexChanged.connect(self._on_combo_ch0)
+        hdr0.addWidget(self.combo_ch0)
+        hdr0.addStretch()
+        lay.addLayout(hdr0)
+
+        # ── CH0 波形（上軌）──
+        self.plot_wave = PlotWidget()
+        self.plot_wave.setLabel('left', '')
+        self.plot_wave.showGrid(x=True, y=True, alpha=0.2)
+        self.plot_wave.setDownsampling(auto=True, mode='peak')
+        self.plot_wave.setClipToView(True)
+        self.plot_wave.getPlotItem().getAxis('bottom').setStyle(showValues=False)
+        self.plot_wave.scene().sigMouseClicked.connect(self._on_click)
+        # 停用內建滾輪縮放，改用工具列按鈕控制
+        self.plot_wave.getViewBox().setMouseEnabled(x=False, y=False)
+        self.plot_wave.setMinimumHeight(60)
+        lay.addWidget(self.plot_wave, stretch=2)
+
+        # ── CH1 header row ──
+        hdr1 = QHBoxLayout()
+        hdr1.setContentsMargins(0, 2, 0, 0)
+        lbl_ch1 = QLabel('軌道 2：')
+        lbl_ch1.setStyleSheet(f'color:{C["dim"]}; font-size:11px;')
+        hdr1.addWidget(lbl_ch1)
+        self.combo_ch1 = QComboBox()
+        self.combo_ch1.setMinimumWidth(130)
+        self.combo_ch1.setMaximumHeight(22)
+        self.combo_ch1.setStyleSheet(self.combo_ch0.styleSheet())
+        self.combo_ch1.currentIndexChanged.connect(self._on_combo_ch1)
+        hdr1.addWidget(self.combo_ch1)
+        hdr1.addStretch()
+        self.hdr1_widget = QWidget()
+        self.hdr1_widget.setLayout(hdr1)
+        self.hdr1_widget.setVisible(False)
+        lay.addWidget(self.hdr1_widget)
+
+        # ── CH1 波形（下軌）──
+        self.plot_wave2 = PlotWidget()
+        self.plot_wave2.setLabel('left', '')
+        self.plot_wave2.setLabel('bottom', '時間 (s)')
+        self.plot_wave2.showGrid(x=True, y=True, alpha=0.2)
+        self.plot_wave2.setDownsampling(auto=True, mode='peak')
+        self.plot_wave2.scene().sigMouseClicked.connect(self._on_click2)
+        self.plot_wave2.getViewBox().setMouseEnabled(x=False, y=False)
+        self.plot_wave2.setVisible(False)
+        self.plot_wave2.setMinimumHeight(60)
+        lay.addWidget(self.plot_wave2, stretch=2)
+
+        # ── RR tachogram（最下方）──
+        self.plot_rr = PlotWidget()
+        self.plot_rr.setLabel('left', 'RR (ms)')
+        self.plot_rr.setLabel('bottom', '時間 (s)')
+        self.plot_rr.showGrid(x=True, y=True, alpha=0.2)
+        self.plot_rr.setXLink(self.plot_wave)
+        self.plot_rr.setMinimumHeight(40)
+        lay.addWidget(self.plot_rr, stretch=1)
+
+        # 預建持久曲線
+        self._curve_wave  = self.plot_wave.plot([], [], pen=pg.mkPen(C['wave'], width=1.0))
+        self._curve_wave2 = self.plot_wave2.plot([], [], pen=pg.mkPen(C['wave_alt'], width=1.0))
+        self._curve_peaks = self.plot_wave.plot([], [], pen=None, symbol='t1',
+                                                 symbolSize=9, symbolBrush=C['red'])
+        self._curve_rr     = self.plot_rr.plot([], [], pen=pg.mkPen(C['green'], width=1.5))
+        self._curve_rr_pts = self.plot_rr.plot([], [], pen=None, symbol='o',
+                                                symbolSize=4, symbolBrush=C['wave_alt'])
+
+        # 測量線（CH0 上）
+        self._line_a = InfiniteLine(pos=0, angle=90, pen=pg.mkPen(C['meas_a'] + 'cc', width=1.5))
+        self._line_b = InfiniteLine(pos=0, angle=90, pen=pg.mkPen(C['meas_b'] + 'cc', width=1.5))
+        self._region_meas = LinearRegionItem(
+            values=[0, 1], brush=pg.mkBrush(QColor(0, 0, 0, 0)), movable=False,
+            pen=pg.mkPen(QColor(0, 0, 0, 0)))
+        self._line_a.setVisible(False)
+        self._line_b.setVisible(False)
+        self._region_meas.setVisible(False)
+        self.plot_wave.addItem(self._line_a)
+        self.plot_wave.addItem(self._line_b)
+        self.plot_wave.addItem(self._region_meas)
+
+        # 測量線（CH1 上，同步）
+        self._line_a2 = InfiniteLine(pos=0, angle=90, pen=pg.mkPen(C['meas_a'] + 'cc', width=1.5))
+        self._line_b2 = InfiniteLine(pos=0, angle=90, pen=pg.mkPen(C['meas_b'] + 'cc', width=1.5))
+        self._region_meas2 = LinearRegionItem(
+            values=[0, 1], brush=pg.mkBrush(QColor(0, 0, 0, 0)), movable=False,
+            pen=pg.mkPen(QColor(0, 0, 0, 0)))
+        self._line_a2.setVisible(False)
+        self._line_b2.setVisible(False)
+        self._region_meas2.setVisible(False)
+        self.plot_wave2.addItem(self._line_a2)
+        self.plot_wave2.addItem(self._line_b2)
+        self.plot_wave2.addItem(self._region_meas2)
+
+        # Slider 防抖動
+        self._slider_timer = QTimer()
+        self._slider_timer.setSingleShot(True)
+        self._slider_timer.timeout.connect(self._draw)
+
+
+        # 底部 slider
+        slider_row = QHBoxLayout()
+        slider_row.addWidget(QLabel('位置：'))
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setMinimum(0)
+        self.slider.setMaximum(10000)
+        self.slider.setValue(0)
+        self.slider.valueChanged.connect(self._on_slider)
+        slider_row.addWidget(self.slider)
+        self.lbl_pos = QLabel('00:00.000')
+        self.lbl_pos.setStyleSheet(f'color:{C["accent"]}; font-size:11px; min-width:80px;')
+        slider_row.addWidget(self.lbl_pos)
+        lay.addLayout(slider_row)
+    # ── 資料載入 ─────────────────────────────────────────────────────────────
+
+    def load(self, data):
+        self._clear_ts_items()
+        self.data = data
+        self.ch_idx   = 0
+        self.ch_idx2  = min(1, data.n_ch - 1)
+        self.t_start  = 0.0
+        self.t_end    = min(10.0, data.duration)
+        self._peaks_cache    = None
+        self.measure_pts     = []
+        self._populate_combos()
+        # 監聽 ViewBox 的 X 範圍變化（鼠標拖曳 / 滾輪縮放）
+        self._draw()
+
+    def _populate_combos(self):
+        if self.data is None:
+            return
+        for combo in [self.combo_ch0, self.combo_ch1]:
+            combo.blockSignals(True)
+            combo.clear()
+            for i in range(self.data.n_ch):
+                combo.addItem(f'CH{i}: {self.data.ch_names[i]}')
+            combo.blockSignals(False)
+        self.combo_ch0.setCurrentIndex(self.ch_idx)
+        self.combo_ch1.setCurrentIndex(self.ch_idx2)
+
+    def _on_combo_ch0(self, idx: int):
+        self.ch_idx = idx
+        self._peaks_cache = None
+        self._draw()
+
+    def _on_combo_ch1(self, idx: int):
+        self.ch_idx2 = idx
+        self._draw()
+
+    def set_channel(self, ch: int):
+        self.ch_idx = ch
+        self.combo_ch0.blockSignals(True)
+        self.combo_ch0.setCurrentIndex(ch)
+        self.combo_ch0.blockSignals(False)
+        self._peaks_cache = None
+        self._draw()
+
+    # ── 繪圖 ─────────────────────────────────────────────────────────────────
+
+    def _draw(self):
+        if self.data is None or getattr(self, '_drawing', False):
+            return
+        self._drawing = True
+
+        MAX = 100_000
+        t0 = self.t_start
+        t1 = self.t_end
+
+        vb = self.plot_wave.getViewBox()
+        vb.blockSignals(True)
+
+        # ── CH0 資料 ──
+        ch0 = self.ch_idx
+        t, y = self.data.segment(ch0, t0, t1)
+        if len(t) == 0:
+            vb.blockSignals(False)
+            self._drawing = False
+            return
+        if self.notch_freq > 0 and len(y) > 10:
+            y = apply_notch(y, self.data.fs, self.notch_freq)
+        if self.bp_enabled and len(y) > 10:
+            y = apply_bandpass(y, self.data.fs, self.bp_lo, self.bp_hi)
+        if len(t) > MAX:
+            step = max(1, len(t) // MAX)
+            t = t[::step]; y = y[::step]
+
+        unit0 = self.data.ch_units[ch0]
+        self.plot_wave.setLabel('left', f'CH{ch0}: {self.data.ch_names[ch0]} ({unit0})')
+        # 先設定範圍，再 setData（clipToView 裁切依賴當前 viewRange）
+        self.plot_wave.setXRange(t0, t1, padding=0)
+        self.plot_wave.setLimits(xMin=0, xMax=self.data.duration)
+        self._curve_wave.setData(t, y)
+
+        vb.blockSignals(False)
+
+        # ── CH1 資料（同樣用 t0/t1，不受上面 setXRange 影響）──
+        if self.dual_mode and self.data.n_ch > 1:
+            ch1 = self.ch_idx2
+            t2, y2 = self.data.segment(ch1, t0, t1)
+            if self.notch_freq > 0 and len(y2) > 10:
+                y2 = apply_notch(y2, self.data.fs, self.notch_freq)
+            if self.bp_enabled and len(y2) > 10:
+                y2 = apply_bandpass(y2, self.data.fs, self.bp_lo, self.bp_hi)
+            if len(t2) > MAX:
+                step2 = max(1, len(t2) // MAX)
+                t2 = t2[::step2]; y2 = y2[::step2]
+            # 先設定範圍，再 setData（clipToView 會用當前 viewRange 裁切）
+            actual_vr = self.plot_wave.getViewBox().viewRange()
+            vb2 = self.plot_wave2.getViewBox()
+            vb2.blockSignals(True)
+            vb2.enableAutoRange(axis=vb2.XAxis, enable=False)
+            vb2.setRange(xRange=actual_vr[0], padding=0)
+            vb2.blockSignals(False)
+            self._curve_wave2.setData(t2, y2)
+            self.plot_wave2.setVisible(True)
+            self.hdr1_widget.setVisible(True)
+            self.plot_rr.getPlotItem().getAxis('bottom').setStyle(showValues=False)
+        else:
+            self._curve_wave2.setData([], [])
+            self.plot_wave2.setVisible(False)
+            self.hdr1_widget.setVisible(False)
+            self.plot_rr.getPlotItem().getAxis('bottom').setStyle(showValues=True)
+
+        # 更新測量線、時間戳記、slider
+        self._update_measure_lines()
+        self._draw_timestamps()
+        self._update_slider()
+        self.view_changed.emit(t0, t1)
+        self._drawing = False
+
+    def _clear_ts_items(self):
+        for item, container in self._ts_items_cache:
+            try:
+                container.removeItem(item)
+            except Exception:
+                pass
+        self._ts_items_cache = []
+
+    def _draw_timestamps(self):
+        self._clear_ts_items()
+
+        if not hasattr(self, '_ts_mgr') or self._ts_mgr is None:
+            return
+
+        plots = [self.plot_wave]
+        if self.dual_mode and self.plot_wave2.isVisible():
+            plots.append(self.plot_wave2)
+
+        for rec in self._ts_mgr.records:
+            ts  = rec['t_start']
+            te  = rec.get('t_end')
+            lbl = rec['label']
+
+            for plot in plots:
+                vb    = plot.getViewBox()
+                vr    = plot.viewRange()
+                y_max = vr[1][1]
+                y_min = vr[1][0]
+                y_rng = y_max - y_min if y_max != y_min else 1.0
+
+                # 起點線
+                ln = InfiniteLine(
+                    pos=ts, angle=90,
+                    pen=pg.mkPen(C['ts_color'], width=1.8))
+                ln.setZValue(10)
+                vb.addItem(ln, ignoreBounds=True)
+                self._ts_items_cache.append((ln, vb))
+
+                # 標籤（只在上軌）
+                if plot is self.plot_wave:
+                    text = pg.TextItem(
+                        f'▼ {lbl}',
+                        color=C['ts_color'],
+                        anchor=(0.0, 0.0))
+                    text.setPos(ts, y_max - y_rng * 0.02)
+                    text.setZValue(20)
+                    vb.addItem(text, ignoreBounds=True)
+                    self._ts_items_cache.append((text, vb))
+
+                # 終點 + 頂端橫線（若有區間）
+                if te is not None:
+                    ln2 = InfiniteLine(
+                        pos=te, angle=90,
+                        pen=pg.mkPen(C['ts_color'], width=1.2,
+                                     style=Qt.PenStyle.DashLine))
+                    ln2.setZValue(10)
+                    vb.addItem(ln2, ignoreBounds=True)
+                    self._ts_items_cache.append((ln2, vb))
+
+                    top_y = y_max - y_rng * 0.015
+                    top_ln = pg.PlotCurveItem(
+                        [ts, te], [top_y, top_y],
+                        pen=pg.mkPen(C['ts_color'], width=2.5))
+                    top_ln.setZValue(10)
+                    vb.addItem(top_ln, ignoreBounds=True)
+                    self._ts_items_cache.append((top_ln, vb))
+
+    def _update_measure_lines(self):
+        show_a = len(self.measure_pts) >= 1
+        show_b = len(self.measure_pts) >= 2
+
+        for line_a, line_b, region in [
+            (self._line_a, self._line_b, self._region_meas),
+            (self._line_a2, self._line_b2, self._region_meas2),
+        ]:
+            if show_a:
+                line_a.setPos(self.measure_pts[0])
+                line_a.setVisible(True)
+            else:
+                line_a.setVisible(False)
+
+            if show_b:
+                line_b.setPos(self.measure_pts[1])
+                line_b.setVisible(True)
+                ta, tb = sorted(self.measure_pts)
+                region.setRegion([ta, tb])
+                region.setVisible(True)
+            else:
+                line_b.setVisible(False)
+                region.setVisible(False)
+
+        # 移除舊的頂端橫線
+        for item, vb in getattr(self, '_meas_top_cache', []):
+            try: vb.removeItem(item)
+            except Exception: pass
+        self._meas_top_cache = []
+
+        # 畫新的頂端橫線
+        if show_b:
+            ta, tb = sorted(self.measure_pts)
+            for plot in [self.plot_wave] + ([self.plot_wave2] if self.dual_mode and self.plot_wave2.isVisible() else []):
+                vb  = plot.getViewBox()
+                vr  = plot.viewRange()
+                y_max = vr[1][1]
+                y_rng = (vr[1][1] - vr[1][0]) or 1.0
+                top_y = y_max - y_rng * 0.015
+                top_ln = pg.PlotCurveItem(
+                    [ta, tb], [top_y, top_y],
+                    pen=pg.mkPen(C['yellow'], width=2.0))
+                top_ln.setZValue(10)
+                vb.addItem(top_ln, ignoreBounds=True)
+                self._meas_top_cache.append((top_ln, vb))
+
+    def set_ts_manager(self, mgr):
+        self._clear_ts_items()
+        self._ts_mgr = mgr
+
+    def set_peaks(self, peaks: np.ndarray, stats: dict):
+        """peaks 一律是相對於整個檔案（從 t=0 開始）的絕對樣本索引，
+        跟目前畫面平移到哪裡無關，這樣平移視窗後峰值標記不會消失或跑位。"""
+        peaks = None if peaks is None else np.asarray(peaks, dtype=int)
+        self._peaks_cache = peaks
+        if self.data is None or peaks is None or len(peaks) == 0:
+            self._curve_peaks.setData([], [])
+            self._curve_rr.setData([], [])
+            self._curve_rr_pts.setData([], [])
+            return
+
+        fs = self.data.fs
+        full_y = self.data.channels[self.ch_idx]
+        valid = peaks[(peaks >= 0) & (peaks < len(full_y))]
+
+        # 波形上的峰值標記：只需要畫「目前有資料涵蓋」的點即可，
+        # y 值直接從完整通道資料取（不受目前視窗範圍限制）。
+        pk_t_all = valid / fs
+        pk_y_all = full_y[valid]
+        self._curve_peaks.setData(pk_t_all, pk_y_all)
+
+        # RR tachogram：用全部峰值（不限於目前視窗）算 RR，
+        # 因為 plot_rr 已跟波形圖共用 X 軸（setXLink），平移時會自動同步顯示。
+        if len(valid) >= 2:
+            rr = np.diff(valid) / fs * 1000
+            rr_t = pk_t_all[1:]
+            mask = (rr > 80) & (rr < 2000)
+            self._curve_rr.setData(rr_t[mask], rr[mask])
+            self._curve_rr_pts.setData(rr_t[mask], rr[mask])
+        else:
+            self._curve_rr.setData([], [])
+            self._curve_rr_pts.setData([], [])
+
+    def clear_peaks(self):
+        """移除全部 R-peak 標記與統計。"""
+        self.set_peaks(np.array([], dtype=int), {})
+
+    # ── 導航 ─────────────────────────────────────────────────────────────────
+
+    def pan(self, direction: float):
+        if self.data is None:
+            return
+        win  = self.t_end - self.t_start
+        step = win * 0.15 * direction
+        new_start = max(0, min(self.data.duration - win, self.t_start + step))
+        self.t_start = new_start
+        self.t_end   = new_start + win
+        self._draw()
+
+    def zoom(self, factor: float):
+        if self.data is None:
+            return
+        center = (self.t_start + self.t_end) / 2
+        win    = (self.t_end - self.t_start) / factor
+        win    = max(0.5, min(self.data.duration, win))   # 最小 0.5 秒
+        self.t_start = max(0.0, center - win / 2)
+        self.t_end   = min(self.data.duration, self.t_start + win)
+        self._draw()
+
+    def reset_view(self):
+        if self.data is None:
+            return
+        self.t_start = 0.0
+        self.t_end   = min(10.0, self.data.duration)
+        self.y_scale = 1.0
+        self._y_auto = True
+        self.plot_wave.enableAutoRange(axis='y')
+        self._draw()
+
+    def zoom_y(self, factor: float, ch: int = 0):
+        """縱軸縮放：ch=0 調整 CH0，ch=1 調整 CH1"""
+        if self.data is None:
+            return
+        plot = self.plot_wave if ch == 0 else self.plot_wave2
+        vr = plot.viewRange()
+        y_min, y_max = vr[1]
+        y_center = (y_min + y_max) / 2
+        y_half = (y_max - y_min) / 2 / factor
+        plot.setYRange(y_center - y_half, y_center + y_half, padding=0)
+
+    def reset_y(self, ch: int = 0):
+        """縱軸回到自動縮放"""
+        if self.data is None:
+            return
+        plot = self.plot_wave if ch == 0 else self.plot_wave2
+        plot.enableAutoRange(axis='y')
+
+    def goto(self, t: float):
+        if self.data is None:
+            return
+        win = self.t_end - self.t_start
+        self.t_start = max(0, min(self.data.duration - win, t - win / 4))
+        self.t_end   = self.t_start + win
+        self._draw()
+
+    def _on_slider(self, val: int):
+        if self.data is None or self._drawing:
+            return
+        win   = self.t_end - self.t_start
+        ratio = val / 10000
+        new_t = ratio * max(0, self.data.duration - win)
+        self.t_start = new_t
+        self.t_end   = new_t + win
+        self.lbl_pos.setText(fmt_hms(new_t))
+        self._draw()   # 即時重繪
+
+    def _update_slider(self):
+        if self.data is None:
+            return
+        win = self.t_end - self.t_start
+        denom = max(self.data.duration - win, 0.001)
+        ratio = self.t_start / denom
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(ratio * 10000))
+        self.slider.blockSignals(False)
+        self.lbl_pos.setText(fmt_hms(self.t_start))
+
+    # ── 測量模式 ─────────────────────────────────────────────────────────────
+
+    def _on_click(self, event):
+        self._handle_click(event, self.plot_wave)
+
+    def _on_click2(self, event):
+        self._handle_click(event, self.plot_wave2)
+
+    def _handle_click(self, event, plot):
+        if not (self.measure_mode or self.peak_edit_mode):
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        pos = event.scenePos()
+        vb  = plot.getViewBox()
+        if not plot.sceneBoundingRect().contains(pos):
+            return
+        mapped = vb.mapSceneToView(pos)
+        t_click = mapped.x()
+
+        if self.peak_edit_mode:
+            self._handle_peak_edit_click(t_click)
+            return
+
+        if len(self.measure_pts) < 2:
+            self.measure_pts.append(t_click)
+        else:
+            self.measure_pts = [t_click]
+
+        self._update_measure_lines()
+        self.measure_updated.emit(self.measure_pts)
+
+    # ── R-peak 手動編輯 ──────────────────────────────────────────────────────
+    # 注意：_peaks_cache 一律存「絕對樣本索引」（相對整個檔案的 t=0），
+    # 而不是相對目前視窗的位置，所以這裡一律用完整通道資料
+    # （self.data.channels[ch]）查值，不受目前平移/縮放到哪裡影響。
+    def _handle_peak_edit_click(self, t_click: float):
+        """點擊已存在的峰值 → 刪除；點擊空白處 → 在附近振幅最大點新增峰值。"""
+        if self.data is None:
+            return
+        fs = self.data.fs
+        full_y = self.data.channels[self.ch_idx]
+        n = len(full_y)
+        if n == 0:
+            return
+
+        idx_click = int(round(t_click * fs))
+        idx_click = max(0, min(n - 1, idx_click))
+
+        peaks = self._peaks_cache
+        peaks = np.array([], dtype=int) if peaks is None else np.asarray(peaks, dtype=int)
+
+        # 點擊容許誤差：依目前縮放的可視範圍比例調整，限制在 3~50 ms 之間
+        win_view = max(self.t_end - self.t_start, 1e-6)
+        tol_sec  = min(max(win_view * 0.01, 0.003), 0.05)
+        tol_samp = max(1, int(tol_sec * fs))
+
+        if len(peaks) > 0:
+            nearest = peaks[int(np.argmin(np.abs(peaks - idx_click)))]
+            if abs(int(nearest) - idx_click) <= tol_samp:
+                peaks = peaks[peaks != nearest]
+                self._apply_edited_peaks(peaks)
+                return
+
+        # 新增峰值：判斷極性（依現有峰值的振幅方向，沒有峰值就預設正向）
+        sign = 1.0
+        if len(peaks) > 0:
+            valid = peaks[(peaks >= 0) & (peaks < n)]
+            if len(valid) > 0:
+                baseline = np.median(full_y)
+                sign = 1.0 if np.median(full_y[valid] - baseline) >= 0 else -1.0
+
+        add_win = max(tol_samp, int(0.03 * fs))   # 至少 ±30ms
+        lo = max(0, idx_click - add_win)
+        hi = min(n, idx_click + add_win + 1)
+        if hi <= lo:
+            return
+        local = full_y[lo:hi] * sign
+        new_idx = lo + int(np.argmax(local))
+
+        if len(peaks) > 0 and np.any(np.abs(peaks - new_idx) <= tol_samp):
+            return   # 附近已經有峰值了，避免重複新增
+
+        peaks = np.sort(np.append(peaks, new_idx)).astype(int)
+        self._apply_edited_peaks(peaks)
+
+    def _apply_edited_peaks(self, peaks: np.ndarray):
+        stats = rr_stats_from_peaks(peaks, self.data.fs) if self.data is not None else {}
+        self.set_peaks(peaks, stats)
+        self.peaks_edited.emit(peaks, stats)
+
+    def remove_all_peaks(self):
+        """移除全部 R-peak 標記（可搭配編輯模式重新手動標記）。"""
+        self.clear_peaks()
+        self.peaks_edited.emit(np.array([], dtype=int), {})
+
+    def toggle_peak_edit(self, on: bool):
+        self.peak_edit_mode = on
+
+    def toggle_dual(self, on: bool):
+        """切換雙通道同時顯示"""
+        self.dual_mode = on
+        self._draw()
+
+    def wheelEvent(self, event):
+        """攔截滾輪事件，用我們自己的 zoom 方法處理"""
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self.zoom(1.5)
+        elif delta < 0:
+            self.zoom(1 / 1.5)
+        event.accept()
+
+    def toggle_measure(self, on: bool):
+        self.measure_mode = on
+        if not on:
+            self.measure_pts = []
+            self._line_a.setVisible(False)
+            self._line_b.setVisible(False)
+            self._region_meas.setVisible(False)
+            self.measure_updated.emit([])
+
+    def clear_measure(self):
+        self.measure_pts = []
+        self._line_a.setVisible(False)
+        self._line_b.setVisible(False)
+        self._region_meas.setVisible(False)
+        self.measure_updated.emit([])
+
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 啟動畫面（拖放區）
+# ══════════════════════════════════════════════════════════════════════════════
+class DropZone(QWidget):
+    file_dropped = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setMinimumSize(500, 360)
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        icon = QLabel('🫀')
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setStyleSheet('font-size: 72px;')
+        lay.addWidget(icon)
+
+        title = QLabel('ECG Analyzer V3')
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet(
+            f'color: {C["accent"]}; font-size: 28px; font-weight: bold; '
+            f'font-family: "SF Pro Display", "Helvetica Neue", "Segoe UI", "Microsoft JhengHei";')
+        lay.addWidget(title)
+
+        sub = QLabel('拖放 .abf 或 .edf 檔案到這裡，或點擊開啟')
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setStyleSheet(f'color: {C["dim"]}; font-size: 14px; margin: 8px;')
+        lay.addWidget(sub)
+
+        btn = QPushButton('  📂  選擇檔案')
+        btn.setFixedSize(200, 44)
+        btn.setStyleSheet(
+            f'QPushButton {{ background: {C["accent"]}; color: {C["bg"]}; '
+            f'font-size: 14px; font-weight: bold; border-radius: 8px; }}'
+            f'QPushButton:hover {{ background: #79b8ff; }}')
+        btn.clicked.connect(self._open_dialog)
+        lay.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        note = QLabel('支援格式：.abf (Axon Binary Format)  ·  .edf (European Data Format)\n取樣率不限，自動偵測通道數')
+        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        note.setStyleSheet(f'color: {C["dim"]}; font-size: 11px; margin-top: 16px;')
+        lay.addWidget(note)
+
+    def _is_supported(self, path: str) -> bool:
+        return path.lower().endswith(('.abf', '.edf'))
+
+    def dragEnterEvent(self, e: QDragEnterEvent):
+        if e.mimeData().hasUrls():
+            urls = e.mimeData().urls()
+            if any(self._is_supported(u.toLocalFile()) for u in urls):
+                e.acceptProposedAction()
+                self.setStyleSheet(
+                    f'background: {C["panel"]}; border: 2px dashed {C["accent"]};')
+
+    def dragLeaveEvent(self, e):
+        self.setStyleSheet('')
+
+    def dropEvent(self, e: QDropEvent):
+        self.setStyleSheet('')
+        for url in e.mimeData().urls():
+            path = url.toLocalFile()
+            if self._is_supported(path):
+                self.file_dropped.emit(path)
+                break
+
+    def _open_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, '開啟 ECG 檔案', '',
+            'ECG Files (*.abf *.edf);;ABF Files (*.abf);;EDF Files (*.edf);;All Files (*)')
+        if path:
+            self.file_dropped.emit(path)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 濾波設定對話框
+# ══════════════════════════════════════════════════════════════════════════════
+class FilterSettingsDialog(QDialog):
+    def __init__(self, parent, notch_freq=0.0, bp_enabled=False,
+                 bp_lo=1.0, bp_hi=150.0):
+        super().__init__(parent)
+        self.setWindowTitle('濾波設定')
+        self.setModal(True)
+        self.setFixedWidth(340)
+
+        base_style = (
+            f'background:{C["bg"]};color:{C["text"]};'
+            f'font-size:12px;'
+        )
+        self.setStyleSheet(
+            f'QDialog{{{base_style}}}'
+            f'QGroupBox{{color:{C["accent"]};border:1px solid {C["border"]};'
+            f'border-radius:6px;margin-top:8px;padding:8px 10px;}}'
+            f'QGroupBox::title{{subcontrol-origin:margin;left:10px;'
+            f'padding:0 4px;color:{C["accent"]};font-weight:bold;}}'
+            f'QRadioButton{{color:{C["text"]};spacing:6px;}}'
+            f'QRadioButton::indicator{{width:14px;height:14px;}}'
+            f'QCheckBox{{color:{C["text"]};spacing:6px;}}'
+            f'QLabel{{color:{C["text"]};font-size:12px;}}'
+            f'QDoubleSpinBox{{background:{C["panel"]};color:{C["text"]};'
+            f'border:1px solid {C["border"]};border-radius:4px;padding:2px 6px;}}'
+            f'QPushButton{{background:{C["panel"]};color:{C["accent"]};'
+            f'border:1px solid {C["border"]};border-radius:5px;'
+            f'padding:5px 18px;font-size:12px;}}'
+            f'QPushButton:hover{{background:{C["border"]};color:{C["text"]}}}'
+            f'QPushButton:pressed{{background:{C["accent"]};color:{C["bg"]}}}'
+        )
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(12)
+        lay.setContentsMargins(16, 16, 16, 16)
+
+        # ── Notch ──
+        grp_notch = QGroupBox('Notch 陷波濾波器')
+        notch_row = QHBoxLayout(grp_notch)
+        notch_row.setSpacing(16)
+        self.rb_notch_off = QRadioButton('關閉')
+        self.rb_notch_50  = QRadioButton('50 Hz')
+        self.rb_notch_60  = QRadioButton('60 Hz')
+        self._notch_grp = QButtonGroup(self)
+        self._notch_grp.addButton(self.rb_notch_off, 0)
+        self._notch_grp.addButton(self.rb_notch_50,  1)
+        self._notch_grp.addButton(self.rb_notch_60,  2)
+        if notch_freq == 50.0:
+            self.rb_notch_50.setChecked(True)
+        elif notch_freq == 60.0:
+            self.rb_notch_60.setChecked(True)
+        else:
+            self.rb_notch_off.setChecked(True)
+        for rb in (self.rb_notch_off, self.rb_notch_50, self.rb_notch_60):
+            notch_row.addWidget(rb)
+        notch_row.addStretch()
+        lay.addWidget(grp_notch)
+
+        # ── Bandpass ──
+        grp_bp = QGroupBox('Bandpass 帶通濾波器')
+        bp_lay = QVBoxLayout(grp_bp)
+        bp_lay.setSpacing(8)
+
+        self.chk_bp = QCheckBox('啟用')
+        self.chk_bp.setChecked(bp_enabled)
+        bp_lay.addWidget(self.chk_bp)
+
+        spin_style = (
+            f'QDoubleSpinBox{{background:{C["panel"]};color:{C["text"]};'
+            f'border:1px solid {C["border"]};border-radius:4px;'
+            f'padding:2px 6px;min-width:80px;}}'
+        )
+
+        row_lo = QHBoxLayout()
+        lbl_lo = QLabel('Low cutoff (Hz):')
+        lbl_lo.setMinimumWidth(120)
+        self.spin_lo = QDoubleSpinBox()
+        self.spin_lo.setRange(0.1, 9999.0)
+        self.spin_lo.setDecimals(1)
+        self.spin_lo.setSingleStep(1.0)
+        self.spin_lo.setValue(bp_lo)
+        self.spin_lo.setStyleSheet(spin_style)
+        row_lo.addWidget(lbl_lo)
+        row_lo.addWidget(self.spin_lo)
+        row_lo.addStretch()
+        bp_lay.addLayout(row_lo)
+
+        row_hi = QHBoxLayout()
+        lbl_hi = QLabel('High cutoff (Hz):')
+        lbl_hi.setMinimumWidth(120)
+        self.spin_hi = QDoubleSpinBox()
+        self.spin_hi.setRange(0.1, 9999.0)
+        self.spin_hi.setDecimals(1)
+        self.spin_hi.setSingleStep(10.0)
+        self.spin_hi.setValue(bp_hi)
+        self.spin_hi.setStyleSheet(spin_style)
+        row_hi.addWidget(lbl_hi)
+        row_hi.addWidget(self.spin_hi)
+        row_hi.addStretch()
+        bp_lay.addLayout(row_hi)
+
+        lay.addWidget(grp_bp)
+
+        self._toggle_bp(bp_enabled)
+        self.chk_bp.toggled.connect(self._toggle_bp)
+
+        # ── Buttons ──
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_apply = QPushButton('套用')
+        btn_apply.setDefault(True)
+        btn_apply.clicked.connect(self.accept)
+        btn_cancel = QPushButton('取消')
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_apply)
+        btn_row.addWidget(btn_cancel)
+        lay.addLayout(btn_row)
+
+    def _toggle_bp(self, enabled: bool):
+        self.spin_lo.setEnabled(enabled)
+        self.spin_hi.setEnabled(enabled)
+
+    def get_settings(self) -> dict:
+        freq_map = {0: 0.0, 1: 50.0, 2: 60.0}
+        return {
+            'notch_freq': freq_map.get(self._notch_grp.checkedId(), 0.0),
+            'bp_enabled': self.chk_bp.isChecked(),
+            'bp_lo':      self.spin_lo.value(),
+            'bp_hi':      self.spin_hi.value(),
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 主視窗
+# ══════════════════════════════════════════════════════════════════════════════
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('ECG Analyzer V3')
+        self.resize(1280, 780)
+        # 允許視窗（連同裡面的 3 個波形圖＋底部 slider）縮到比較小的
+        # 筆電螢幕也能完整顯示，避免因為子元件的最小尺寸加總起來太高，
+        # 導致視窗被 Qt 強制撐高、下緣（底部 slider）跑到畫面外。
+        self.setMinimumSize(800, 480)
+        self.setAcceptDrops(True)
+
+        self.ecg_data = None   # ABFData | EDFData
+        self.ts_mgr   : TimestampManager | None = None
+        self.detector_thread: PeakDetector | None = None
+
+        self._build_ui()
+        self._build_toolbar()
+        self._build_statusbar()
+
+        self._fitted_to_screen = False
+
+    # ── 螢幕可用區域校正 ─────────────────────────────────────────────────────
+    # Windows 在高 DPI 縮放（125%／150%…）或筆電較小的螢幕解析度時，若視窗
+    # 高度超過工作區域（扣掉工作列後的可視範圍），視窗下緣（狀態列、底部
+    # slider）會被裁到螢幕外或被工作列蓋住而點不到。這裡在視窗顯示後，
+    # 依實際可用區域夾住大小並置中；如果可用高度比預設值還小很多，直接
+    # 最大化視窗（showMaximized 交給作業系統自己處理工作列/多螢幕邊界，
+    # 比自己手動算座標更不容易出錯），確保整個視窗都在可視範圍內。
+    def _fit_to_screen(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+
+        if avail.height() < self.height() or avail.width() < self.width():
+            self.showMaximized()
+            return
+
+        w = min(self.width(), avail.width())
+        h = min(self.height(), avail.height())
+        if w != self.width() or h != self.height():
+            self.resize(w, h)
+        x = avail.x() + max(0, (avail.width() - w) // 2)
+        y = avail.y() + max(0, (avail.height() - h) // 2)
+        self.move(x, y)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._fitted_to_screen:
+            self._fitted_to_screen = True
+            self._fit_to_screen()
+
+    # ── UI 建構 ──────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.stack = QWidget()
+        self.setCentralWidget(self.stack)
+        self.stack_lay = QVBoxLayout(self.stack)
+        self.stack_lay.setContentsMargins(0, 0, 0, 0)
+
+        # 拖放區
+        self.drop_zone = DropZone()
+        self.drop_zone.file_dropped.connect(self.open_file)
+        self.stack_lay.addWidget(self.drop_zone)
+
+        # 主工作區（隱藏直到載入檔案）
+        self.main_widget = QWidget()
+        self.main_widget.setVisible(False)
+        main_lay = QHBoxLayout(self.main_widget)
+        main_lay.setContentsMargins(0, 0, 0, 0)
+        main_lay.setSpacing(0)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # 波形區
+        self.waveform = WaveformWidget()
+        self.waveform.measure_updated.connect(self._on_measure_updated)
+        self.waveform.view_changed.connect(self._on_view_changed)
+        self.waveform.peaks_edited.connect(self._on_peaks_edited)
+        splitter.addWidget(self.waveform)
+
+        # 側邊面板
+        self.side = SidePanel()
+        self.side.ts_selected.connect(self._on_ts_selected)
+        self.side.ts_deleted.connect(self._on_ts_deleted)
+        self.side.ts_renamed.connect(self._on_ts_renamed)
+        self.side.ts_goto.connect(self.waveform.goto)
+        splitter.addWidget(self.side)
+
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+        main_lay.addWidget(splitter)
+
+        self.stack_lay.addWidget(self.main_widget)
+
+    def _build_toolbar(self):
+        tb = self.addToolBar('主工具列')
+        tb.setMovable(False)
+        tb.setIconSize(QSize(16, 16))
+
+        def act(text, tip, cb, shortcut=None):
+            a = QAction(text, self)
+            a.setToolTip(tip)
+            a.triggered.connect(cb)
+            if shortcut:
+                a.setShortcut(QKeySequence(shortcut))
+            tb.addAction(a)
+            return a
+
+        act('開啟', '開啟 .abf 檔案', self._menu_open, 'Ctrl+O')
+        tb.addSeparator()
+
+        # 往前/往後：按住持續移動
+        self._pan_timer = QTimer()
+        self._pan_timer.setInterval(80)
+        self._key_pan_timer = QTimer()
+        self._key_pan_timer.setInterval(80)
+
+        btn_style = (
+            f'QPushButton{{background:{C["panel"]};color:{C["accent"]};'
+            f'border:1px solid {C["border"]};border-radius:5px;padding:5px 10px;}}'
+            f'QPushButton:hover{{background:{C["border"]};color:{C["text"]}}}'
+            f'QPushButton:pressed{{background:{C["accent"]};color:{C["bg"]}}}')
+
+        btn_prev = QPushButton('◀ 往前')
+        btn_prev.setToolTip('往前平移，按住持續移動 (←)')
+        btn_prev.setStyleSheet(btn_style)
+        btn_prev.pressed.connect(lambda: self._start_pan(-1))
+        btn_prev.released.connect(self._stop_pan)
+        tb.addWidget(btn_prev)
+
+        btn_next = QPushButton('往後 ▶')
+        btn_next.setToolTip('往後平移，按住持續移動 (→)')
+        btn_next.setStyleSheet(btn_style)
+        btn_next.pressed.connect(lambda: self._start_pan(+1))
+        btn_next.released.connect(self._stop_pan)
+        tb.addWidget(btn_next)
+
+        act('放大', '放大時間軸 (+)', lambda: self.waveform.zoom(2.0), '+')
+        act('縮小', '縮小時間軸 (-)', lambda: self.waveform.zoom(0.5), '-')
+        act('重設', '重設視圖 (R)', self.waveform.reset_view, 'R')
+        tb.addSeparator()
+
+        # CH0 縱軸
+        tb.addWidget(QLabel('  CH0：'))
+        act('▲', 'CH0 放大 (W)', lambda: self.waveform.zoom_y(2.0, 0), 'W')
+        act('▼', 'CH0 縮小 (S)', lambda: self.waveform.zoom_y(0.5, 0), 'S')
+        act('自動', 'CH0 自動縮放', lambda: self.waveform.reset_y(0))
+        tb.addSeparator()
+
+        # CH1 縱軸
+        tb.addWidget(QLabel('  CH1：'))
+        act('▲', 'CH1 放大 (E)', lambda: self.waveform.zoom_y(2.0, 1), 'E')
+        act('▼', 'CH1 縮小 (C)', lambda: self.waveform.zoom_y(0.5, 1), 'C')
+        act('自動', 'CH1 自動縮放', lambda: self.waveform.reset_y(1))
+        tb.addSeparator()
+
+        # 測量
+        self.act_measure = QAction('測量', self)
+        self.act_measure.setToolTip('測量模式：點擊A→B計算時間差 (M)')
+        self.act_measure.setCheckable(True)
+        self.act_measure.setShortcut(QKeySequence('M'))
+        self.act_measure.toggled.connect(self._toggle_measure)
+        tb.addAction(self.act_measure)
+        tb.addSeparator()
+
+        act('偵測 R-peaks', '自動偵測 R-peak 並計算 RR 間距 (P)',
+            self._detect_peaks, 'P')
+
+        # 手動編輯 R-peak
+        self.act_peak_edit = QAction('編輯 R-peak', self)
+        self.act_peak_edit.setToolTip(
+            '手動修正 R-peak：點擊已標記的峰值可刪除，點擊空白處會在附近振幅最大點新增 (X)')
+        self.act_peak_edit.setCheckable(True)
+        self.act_peak_edit.setShortcut(QKeySequence('X'))
+        self.act_peak_edit.toggled.connect(self._toggle_peak_edit)
+        tb.addAction(self.act_peak_edit)
+
+        act('清除 R-peak', '移除目前所有 R-peak 標記', self._clear_all_peaks)
+        tb.addSeparator()
+
+        btn_filter = QPushButton('濾波...')
+        btn_filter.setToolTip('設定 Notch 陷波 / Bandpass 帶通濾波器')
+        btn_filter.setStyleSheet(btn_style)
+        btn_filter.clicked.connect(self._open_filter_dialog)
+        tb.addWidget(btn_filter)
+        self.lbl_filter_state = QLabel('  Off')
+        self.lbl_filter_state.setStyleSheet(f'color:{C["dim"]};font-size:11px;')
+        tb.addWidget(self.lbl_filter_state)
+        tb.addSeparator()
+
+        act('截圖', '儲存目前畫面 (Q)', self._screenshot, 'Q')
+        act('說明', '快捷鍵說明', self._show_help)
+        tb.addSeparator()
+        act('前往時間點', '跳到指定時間點 (G)', self._show_goto_dialog, 'G')
+        tb.addSeparator()
+        act('匯入實驗記錄', '從 Excel dOMAP 分頁匯入時間戳記', self._import_excel)
+
+    def _build_statusbar(self):
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
+        self.lbl_status = QLabel('請開啟 .abf 或 .edf 檔案，或將其拖入視窗')
+        self.lbl_status.setStyleSheet(f'color:{C["dim"]}')
+        self.status.addWidget(self.lbl_status)
+
+        self.lbl_mode = QLabel()
+        self.lbl_mode.setStyleSheet(f'color:{C["yellow"]}; font-weight:bold;')
+        self.status.addPermanentWidget(self.lbl_mode)
+
+    # ── 檔案開啟 ─────────────────────────────────────────────────────────────
+
+    def _menu_open(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, '開啟 ECG 檔案', '',
+            'ECG Files (*.abf *.edf);;ABF Files (*.abf);;EDF Files (*.edf);;All Files (*)')
+        if path:
+            self.open_file(path)
+
+    def open_file(self, path: str):
+        try:
+            self.lbl_status.setText(f'載入中：{os.path.basename(path)} ...')
+            QApplication.processEvents()
+
+            self.ecg_data = load_ecg_file(path)
+            self.ts_mgr   = TimestampManager(path)
+
+            self.waveform.set_ts_manager(self.ts_mgr)
+            self.side.set_ts_manager(self.ts_mgr)
+            self.side.set_ecg_data(self.ecg_data)
+            self.side.update_file_info(self.ecg_data)
+            try:
+                self.side.ts_save_requested.disconnect()
+            except Exception:
+                pass
+            self.side.ts_save_requested.connect(self._save_timestamp)
+            self.waveform.load(self.ecg_data)
+
+            self.drop_zone.setVisible(False)
+            self.main_widget.setVisible(True)
+
+            name = os.path.basename(path)
+            self.setWindowTitle(f'ECG Analyzer V3 — {name}')
+            info = self.ecg_data.info()
+            dt_str = (f"  |  📅 {info['rec_date']}  🕐 {info['rec_time']} → {info['rec_end']}"
+                      if info['rec_date'] != '—' else '')
+            self.lbl_status.setText(
+                f'{name}  |  {self.ecg_data.fs:,.0f} Hz  |  '
+                f'{fmt_hms(self.ecg_data.duration)}  |  '
+                f'{self.ecg_data.n_ch} 通道{dt_str}')
+
+        except Exception as e:
+            QMessageBox.critical(self, '錯誤', f'無法開啟檔案：\n{e}\n\n{traceback.format_exc()}')
+
+    # ── 工具列動作 ────────────────────────────────────────────────────────────
+
+    def _start_pan(self, direction: int):
+        self._pan_direction = direction
+        self.waveform.pan(direction)          # 立即移動一次
+        self._pan_timer.timeout.connect(lambda: self.waveform.pan(self._pan_direction))
+        self._pan_timer.start()
+
+    def _stop_pan(self):
+        self._pan_timer.stop()
+        try:
+            self._pan_timer.timeout.disconnect()
+        except Exception:
+            pass
+
+    def _toggle_dual(self, on: bool):
+        self.waveform.toggle_dual(on)
+        if on:
+            self.lbl_mode.setText('⊕ 雙通道模式  |  藍=主通道  綠=次通道（振幅正規化）')
+        else:
+            self.lbl_mode.setText('')
+
+    def _toggle_measure(self, on: bool):
+        if on and self.act_peak_edit.isChecked():
+            self.act_peak_edit.setChecked(False)
+        self.waveform.toggle_measure(on)
+        if on:
+            self.lbl_mode.setText('📏 測量模式  |  點擊波形設定 A / B 點')
+        else:
+            self.lbl_mode.setText('')
+
+    def _toggle_peak_edit(self, on: bool):
+        if on and self.act_measure.isChecked():
+            self.act_measure.setChecked(False)
+        self.waveform.toggle_peak_edit(on)
+        if on:
+            self.lbl_mode.setText('✏️ R-peak 編輯模式  |  點擊峰值刪除、點擊空白處新增')
+        else:
+            self.lbl_mode.setText('')
+
+    def _on_peaks_edited(self, peaks, stats: dict):
+        self.side.update_rr(stats)
+        if stats:
+            self.lbl_status.setText(
+                f'手動編輯後：{stats["count"]} 個 R-peaks  |  '
+                f'HR: {stats["hr"]} bpm  |  '
+                f'RR: {stats["rr_mean"]}±{stats["rr_std"]} ms')
+        else:
+            self.lbl_status.setText(f'手動編輯後：{len(peaks)} 個 R-peaks（統計資料不足）')
+
+    def _clear_all_peaks(self):
+        if self.waveform._peaks_cache is None or len(self.waveform._peaks_cache) == 0:
+            return
+        reply = QMessageBox.question(
+            self, '清除 R-peak',
+            '確定要移除目前所有 R-peak 標記嗎？\n（可以之後重新按 P 偵測，或用 X 編輯模式手動標記）',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.waveform.remove_all_peaks()
+        self.side.update_rr({})
+        self.lbl_status.setText('已移除所有 R-peak 標記')
+
+    def _save_timestamp(self):
+        if self.ecg_data is None:
+            return
+        pts = self.waveform.measure_pts
+        if len(pts) == 0:
+            QMessageBox.information(self, '提示',
+                '請先進入測量模式（M）並點擊 A / B 點，\n或直接以目前視窗中心作為單點時間戳記。')
+            t_mid = (self.waveform.t_start + self.waveform.t_end) / 2
+            dlg = TimestampDialog(t_mid, None, self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                label, note, tag = dlg.get_data()
+                self.ts_mgr.add(t_mid, None, label, note, tag)
+                self.side.refresh_ts_list()
+                self.waveform._draw()
+            return
+
+        t_a = pts[0]
+        t_b = pts[1] if len(pts) > 1 else None
+        dlg = TimestampDialog(t_a, t_b, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            label, note, tag = dlg.get_data()
+            rec = self.ts_mgr.add(
+                min(t_a, t_b) if t_b else t_a,
+                max(t_a, t_b) if t_b else None,
+                label, note, tag, self.ecg_data)
+            self.side.refresh_ts_list()
+            self.waveform._draw()
+            self.lbl_status.setText(
+                f'時間戳記已儲存：{rec["label"]}  {rec["t_start_hms"]}')
+
+    def _open_filter_dialog(self):
+        dlg = FilterSettingsDialog(
+            self,
+            notch_freq=self.waveform.notch_freq,
+            bp_enabled=self.waveform.bp_enabled,
+            bp_lo=self.waveform.bp_lo,
+            bp_hi=self.waveform.bp_hi,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            s = dlg.get_settings()
+            self.waveform.notch_freq = s['notch_freq']
+            self.waveform.bp_enabled = s['bp_enabled']
+            self.waveform.bp_lo      = s['bp_lo']
+            self.waveform.bp_hi      = s['bp_hi']
+            self._update_filter_label()
+            self.waveform._draw()
+
+    def _update_filter_label(self):
+        parts = []
+        nf = self.waveform.notch_freq
+        if nf > 0:
+            parts.append(f'Notch {int(nf)} Hz')
+        if self.waveform.bp_enabled:
+            parts.append(f'BP {self.waveform.bp_lo:.0f}–{self.waveform.bp_hi:.0f} Hz')
+        if parts:
+            self.lbl_filter_state.setText('  ' + ' | '.join(parts))
+            self.lbl_filter_state.setStyleSheet(f'color:{C["accent"]};font-size:11px;')
+        else:
+            self.lbl_filter_state.setText('  Off')
+            self.lbl_filter_state.setStyleSheet(f'color:{C["dim"]};font-size:11px;')
+
+    def _detect_peaks(self):
+        if self.ecg_data is None:
+            return
+        t, y = self.ecg_data.segment(
+            self.waveform.ch_idx,
+            self.waveform.t_start,
+            self.waveform.t_end)
+
+        self.lbl_status.setText('正在偵測 R-peaks...')
+        self.detector_thread = PeakDetector(
+            y, self.ecg_data.fs, self.waveform.t_start,
+            notch_freq=self.waveform.notch_freq,
+            bp_enabled=self.waveform.bp_enabled,
+            bp_lo=self.waveform.bp_lo,
+            bp_hi=self.waveform.bp_hi)
+        self.detector_thread.finished.connect(self._on_peaks_done)
+        self.detector_thread.start()
+
+    def _on_peaks_done(self, peaks, stats):
+        # PeakDetector 是對「目前視窗那段」資料做偵測，回傳的 peaks 是相對
+        # 那一段的索引；轉成絕對樣本索引（相對整個檔案）存起來，這樣之後
+        # 平移視窗，峰值標記才不會消失或對不上。用偵測當下記錄的
+        # t_offset，而不是現在的 self.waveform.t_start，避免偵測跑的期間
+        # 剛好被平移過而算錯。
+        if self.ecg_data is not None and self.detector_thread is not None and len(peaks) > 0:
+            s_off = max(0, int(self.detector_thread.t_offset * self.ecg_data.fs))
+            peaks = np.asarray(peaks, dtype=int) + s_off
+        self.waveform.set_peaks(peaks, stats)
+        self.side.update_rr(stats)
+        if stats:
+            self.lbl_status.setText(
+                f'偵測到 {stats["count"]} 個 R-peaks  |  '
+                f'HR: {stats["hr"]} bpm  |  '
+                f'RR: {stats["rr_mean"]}±{stats["rr_std"]} ms  |  '
+                f'RMSSD: {stats["rmssd"]} ms  |  CV: {stats["cv"]}%')
+        else:
+            self.lbl_status.setText('R-peak 偵測完成（結果不足）')
+
+    def _show_goto_dialog(self):
+        if self.ecg_data is None:
+            return
+
+        rec_dt = self.ecg_data.rec_datetime
+        dur    = self.ecg_data.duration
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('前往時間點')
+        dlg.setModal(True)
+        dlg.setFixedWidth(360)
+
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(10)
+        lay.setContentsMargins(16, 16, 16, 16)
+
+        # 記錄時間資訊
+        if rec_dt:
+            end_dt  = rec_dt + datetime.timedelta(seconds=dur)
+            info_str = f'{rec_dt.strftime("%H:%M:%S")} → {end_dt.strftime("%H:%M:%S")}   ({fmt_hms(dur)})'
+        else:
+            info_str = f'總長度：{fmt_hms(dur)}'
+        lbl_info = QLabel(f'記錄時間：{info_str}')
+        lbl_info.setStyleSheet(f'color:{C["accent"]}; font-size:11px;')
+        lay.addWidget(lbl_info)
+
+        edit_style = (
+            f'QLineEdit{{background:{C["panel"]};color:{C["text"]};'
+            f'border:1px solid {C["border"]};border-radius:6px;'
+            f'padding:6px 10px;font-size:14px;}}'
+            f'QLineEdit:focus{{border-color:{C["accent"]};}}')
+
+        # ── 相對時間 ──
+        grp_rel = QGroupBox('相對時間（從記錄開始）')
+        grp_rel.setStyleSheet(f'QGroupBox{{color:{C["dim"]};font-size:11px;}}')
+        rel_lay = QVBoxLayout(grp_rel)
+        edit_rel = QLineEdit()
+        edit_rel.setPlaceholderText('秒數  /  mm:ss  /  hh:mm:ss    例：48    01:23    1:23:45')
+        edit_rel.setStyleSheet(edit_style)
+        rel_lay.addWidget(edit_rel)
+        lay.addWidget(grp_rel)
+
+        # ── 絕對時間 ──
+        grp_abs = QGroupBox('絕對時間（時鐘時間）')
+        grp_abs.setStyleSheet(f'QGroupBox{{color:{C["dim"]};font-size:11px;}}')
+        abs_lay = QVBoxLayout(grp_abs)
+        edit_abs = QLineEdit()
+        if rec_dt:
+            edit_abs.setPlaceholderText(f'HH:MM:SS    例：{rec_dt.strftime("%H:%M:%S")}')
+            edit_abs.setEnabled(True)
+        else:
+            edit_abs.setPlaceholderText('（此檔案無記錄時間資訊）')
+            edit_abs.setEnabled(False)
+        edit_abs.setStyleSheet(edit_style)
+        abs_lay.addWidget(edit_abs)
+        lay.addWidget(grp_abs)
+
+        lbl_err = QLabel('')
+        lbl_err.setStyleSheet(f'color:{C["red"]}; font-size:11px;')
+        lay.addWidget(lbl_err)
+
+        btn_row = QHBoxLayout()
+        btn_ok = QPushButton('前往')
+        btn_ok.setObjectName('btn_success')
+        btn_cancel = QPushButton('取消')
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        lay.addLayout(btn_row)
+
+        def parse_rel(text):
+            parts = text.replace(',', '.').split(':')
+            if len(parts) == 1:   return float(parts[0])
+            elif len(parts) == 2: return int(parts[0]) * 60 + float(parts[1])
+            elif len(parts) == 3: return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            return None
+
+        def parse_abs(text):
+            if not rec_dt: return None
+            parts = text.replace(',', '.').split(':')
+            if len(parts) == 2:
+                h = rec_dt.hour; m = int(parts[0]); s = float(parts[1])
+            elif len(parts) == 3:
+                h = int(parts[0]); m = int(parts[1]); s = float(parts[2])
+            else: return None
+            target = rec_dt.replace(hour=h, minute=m,
+                                    second=int(s),
+                                    microsecond=int((s % 1) * 1_000_000))
+            diff = (target - rec_dt).total_seconds()
+            if diff < 0: diff += 86400
+            return diff
+
+        def do_goto():
+            t_sec = None
+            text_abs = edit_abs.text().strip()
+            text_rel = edit_rel.text().strip()
+            try:
+                if text_abs and rec_dt:
+                    t_sec = parse_abs(text_abs)
+                elif text_rel:
+                    t_sec = parse_rel(text_rel)
+            except (ValueError, AttributeError):
+                t_sec = None
+            if t_sec is None:
+                lbl_err.setText('無法解析，請確認格式')
+                return
+            t_sec = max(0.0, min(dur, t_sec))
+            self.waveform.goto(t_sec)
+            self.lbl_status.setText(
+                f'已前往：{fmt_hms(t_sec)}  ({self.ecg_data.abs_time(t_sec)})')
+            dlg.accept()
+
+        btn_ok.clicked.connect(do_goto)
+        btn_cancel.clicked.connect(dlg.reject)
+        edit_rel.returnPressed.connect(do_goto)
+        edit_abs.returnPressed.connect(do_goto)
+        edit_rel.setFocus()
+        dlg.exec()
+
+    def _import_excel(self):
+        if self.ecg_data is None:
+            QMessageBox.information(self, '提示', '請先開啟 ECG 檔案')
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, '選擇實驗記錄 Excel', '',
+            'Excel Files (*.xlsx *.xls);;All Files (*)')
+        if not path:
+            return
+
+        try:
+            events = parse_domap(path)
+        except ImportError as e:
+            QMessageBox.critical(self, '缺少套件',
+                f'{e}\n\n請執行 install.command 重新安裝。')
+            return
+        except Exception as e:
+            QMessageBox.critical(self, '讀取失敗', str(e))
+            return
+
+        if not events:
+            QMessageBox.information(self, '結果', '找不到有 OMAP# 編號的事件')
+            return
+
+        dlg = ExcelImportDialog(events, self.ecg_data, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        valid = dlg.get_valid_events()
+        for ev in valid:
+            self.ts_mgr.add(ev['t_sec'], None, ev['label'], ev['note'],
+                            '', self.ecg_data)
+
+        self.side.refresh_ts_list()
+        self.waveform._draw()
+        self.lbl_status.setText(
+            f'已匯入 {len(valid)} 筆時間戳記（來自 {os.path.basename(path)}）')
+
+    def _screenshot(self):
+        if self.ecg_data is None:
+            return
+        base = os.path.splitext(self.ecg_data.path)[0]
+        now  = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = f'{base}_screenshot_{now}.png'
+        pixmap = self.grab()
+        pixmap.save(path)
+        self.lbl_status.setText(f'截圖已儲存：{os.path.basename(path)}')
+
+    def _show_help(self):
+        QMessageBox.information(self, '快捷鍵說明', """
+ECG Analyzer V3 快捷鍵
+支援格式：.abf / .edf
+━━━━━━━━━━━━━━━━━━━━━━━
+← / →     平移波形
++ / -     縮放時間軸
+R         重設視圖
+M         切換測量模式
+T         儲存時間戳記
+P         偵測 R-peaks
+X         切換 R-peak 編輯模式
+S         截圖存檔
+
+測量模式：
+  進入 M 後，左鍵點擊波形設定 A 點，
+  再次點擊設定 B 點，側邊欄顯示 Δt、Δt(ms) 與該範圍平均 BPM。
+  按 T 將區間儲存為時間戳記（JSON + CSV）。
+
+R-peak 編輯模式：
+  進入 X 後，點擊已標記的三角形可以刪除該峰值；
+  點擊空白處會在附近振幅最大的樣本點新增峰值。
+  編輯後 RR 間距與 HR 統計會即時更新。
+  R-peak 標記會保留、不受平移視窗影響；
+  工具列「清除 R-peak」可一次移除全部標記。
+
+時間戳記：
+  側邊欄可點選跳至對應時間，雙擊跳轉。
+  儲存位置：與 .abf 同目錄。
+━━━━━━━━━━━━━━━━━━━━━━━
+""")
+
+    # ── 訊號處理 ─────────────────────────────────────────────────────────────
+
+
+
+    # 測量範圍超過此秒數就不即時計算 BPM（避免大範圍時卡住 UI），
+    # 請改用「偵測 R-peaks (P)」在背景執行緒中計算。
+    MEASURE_BPM_MAX_SEC = 300
+
+    def _cached_peak_times_in_range(self, t_a: float, t_b: float):
+        """回傳目前已標記（『偵測 R-peaks』或手動新增/刪除過）的峰值中，
+        落在 [t_a, t_b] 範圍內的絕對時間。峰值一律存絕對樣本索引，跟
+        目前畫面平移到哪裡無關；若沒有任何標記，回傳 None 讓呼叫端改用
+        即時偵測。"""
+        peaks = self.waveform._peaks_cache
+        if peaks is None or len(peaks) == 0 or self.ecg_data is None:
+            return None
+        fs = self.ecg_data.fs
+        times = np.asarray(peaks, dtype=float) / fs
+        return times[(times >= t_a) & (times <= t_b)]
+
+    def _on_measure_updated(self, pts: list):
+        bpm_info = None
+        if len(pts) >= 2 and self.ecg_data is not None:
+            t_a, t_b = sorted(pts[:2])
+            dur = t_b - t_a
+            if dur > 0:
+                # 優先沿用畫面上已經有的峰值標記（可能是「偵測 R-peaks」
+                # 的結果，也可能已經被手動新增/刪除修正過），確保測量範圍
+                # 的 BPM 跟你在圖上實際看到、修正過的峰值一致，而不是每次
+                # 都重新跑一次自動偵測、把你手動的修正忽略掉。
+                cached_times = self._cached_peak_times_in_range(t_a, t_b)
+                if cached_times is not None and len(cached_times) > 0:
+                    bpm_info = rr_stats_from_times(cached_times) or {'count': len(cached_times)}
+                elif dur > self.MEASURE_BPM_MAX_SEC:
+                    bpm_info = {'skipped': True}
+                else:
+                    try:
+                        _, y = self.ecg_data.segment(self.waveform.ch_idx, t_a, t_b)
+                        peaks, stats = detect_r_peaks_and_stats(
+                            y, self.ecg_data.fs,
+                            notch_freq=self.waveform.notch_freq,
+                            bp_enabled=self.waveform.bp_enabled,
+                            bp_lo=self.waveform.bp_lo,
+                            bp_hi=self.waveform.bp_hi)
+                        bpm_info = stats if stats else {'count': len(peaks)}
+                    except Exception:
+                        bpm_info = None
+        self.side.update_measure(pts, bpm_info)
+
+    def _on_view_changed(self, t0: float, t1: float):
+        self.side.update_view(t0, t1)
+
+    def _on_ts_selected(self, idx: int):
+        pass  # 可以加高亮
+
+    def _on_ts_deleted(self, indices: list):
+        if self.ts_mgr:
+            for idx in sorted(indices, reverse=True):
+                self.ts_mgr.remove(idx)
+            self.side.refresh_ts_list()
+            self.waveform._draw()
+
+    def _on_ts_renamed(self, idx: int, label: str, note: str, tag: str):
+        if self.ts_mgr:
+            self.ts_mgr.update(idx, label, note, tag)
+            self.side.refresh_ts_list()
+            self.waveform._draw()
+
+    # ── 拖放（主視窗）────────────────────────────────────────────────────────
+
+    def keyPressEvent(self, event):
+        if event.isAutoRepeat():
+            return   # 忽略系統的 auto-repeat，我們自己控制
+        key = event.key()
+        if key == Qt.Key.Key_Left:
+            self._start_pan(-1)
+        elif key == Qt.Key.Key_Right:
+            self._start_pan(+1)
+        else:
+            super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.isAutoRepeat():
+            return
+        key = event.key()
+        if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            self._stop_pan()
+        else:
+            super().keyReleaseEvent(event)
+
+    def dragEnterEvent(self, e: QDragEnterEvent):
+        if e.mimeData().hasUrls():
+            urls = e.mimeData().urls()
+            if any(u.toLocalFile().lower().endswith(('.abf', '.edf')) for u in urls):
+                e.acceptProposedAction()
+
+    def dropEvent(self, e: QDropEvent):
+        for url in e.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith(('.abf', '.edf')):
+                self.open_file(path)
+                break
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 進入點
+# ══════════════════════════════════════════════════════════════════════════════
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName('ECG Analyzer V3')
+    app.setApplicationVersion('3.0')
+    app.setOrganizationName('Lab Tools')
+    app.setStyleSheet(STYLESHEET)
+
+    win = MainWindow()
+    win.show()
+
+    # 命令列直接開啟
+    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+        win.open_file(sys.argv[1])
+
+    sys.exit(app.exec())
+
+
+if __name__ == '__main__':
+    main()

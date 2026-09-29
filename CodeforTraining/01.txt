@@ -1,0 +1,48 @@
+MegaWin ASCII file
+
+[DEFINITIONS]
+Version=1
+ChannelCount=4
+DataType=1
+SamplingFreq=10000.000000
+FirstSampleTime=0.000100
+PhaseName=Raw 2019/7/17 ¤U¤È 03:11:05
+
+
+[COMMENT]
+
+
+
+[SOURCE NAMES]
+ No name
+ No name
+ No name
+ No name
+
+
+[SIDE INFO]
+L
+L
+L
+L
+
+
+[UNITS]
+uV
+uV
+uV
+uV
+
+
+[MARKERS]
+306.10580
+607.08460
+608.98420
+969.75080
+971.43060
+1332.59700
+
+
+Duration: 1333.26
+
+[DATA]

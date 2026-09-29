@@ -1,0 +1,64 @@
+# ════════════════════════════════════════════════════════════
+#  排除清單（.gitignore）
+#  列在這裡的檔案「不會」被 Git 存檔，也不會被上傳到 GitHub
+# ════════════════════════════════════════════════════════════
+
+# ── 金鑰、密碼、帳號憑證 ─────────────────────────────────────
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.keychain
+id_rsa*
+id_ed25519*
+*secret*
+*secrets*
+*password*
+*passwd*
+*token*
+*credential*
+*credentials*
+*apikey*
+*api_key*
+.netrc
+.pypirc
+
+# ── 實驗原始資料（檔案太大，且屬研究資料，不上傳雲端）──────
+SKNA raw data/
+*.abf
+*.acq
+*.edf
+
+# ── 分析結果、標記檔（研究資料）───────────────────────────
+*.xlsx
+*.xls
+*.csv
+*_marks.json
+
+# ── 壓縮檔、編譯後的二進位檔 ─────────────────────────────
+*.zip
+*.mexmaci64
+*.mexa64
+*.mexw64
+
+# ── Python 暫存 ───────────────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ── 舊版 App 與 App 內的程式副本（原始碼已在 ecg_app.py）────
+ECG Analyzer V4.app/
+ECG Analyzer.app/Contents/Resources/ecg_app.py
+
+# ── 系統與編輯器產生的雜檔 ───────────────────────────────
+.DS_Store
+._*
+*.log
+*.asv
+*.swp
+.idea/
+.vscode/
