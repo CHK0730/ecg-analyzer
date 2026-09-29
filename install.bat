@@ -7,14 +7,14 @@ exit /b %errorlevel%
 
 :main
 REM ============================================================
-REM  ECG Analyzer V4 — Windows 安裝程式
+REM  ECG Analyzer V5 — Windows 安裝程式
 REM ============================================================
-title ECG Analyzer V4 安裝程式
+title ECG Analyzer V5 安裝程式
 setlocal enabledelayedexpansion
 
 echo.
 echo ================================================
-echo         ECG Analyzer V4 安裝程式 (Windows)
+echo         ECG Analyzer V5 安裝程式 (Windows)
 echo ================================================
 echo.
 
@@ -94,34 +94,34 @@ echo.
 REM ── 建立桌面捷徑 ────────────────────────────────────────────
 echo 建立桌面捷徑...
 
-set "LAUNCHER=%DIR%啟動 ECG Analyzer V4.bat"
-set "SHORTCUT=%USERPROFILE%\Desktop\ECG Analyzer V4.lnk"
+set "LAUNCHER=%DIR%啟動 ECG Analyzer V5.bat"
+set "SHORTCUT=%USERPROFILE%\Desktop\ECG Analyzer V5.lnk"
 
 powershell -NoProfile -Command ^
     "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('%SHORTCUT%');" ^
     "$s.TargetPath = '%LAUNCHER%';" ^
     "$s.WorkingDirectory = '%DIR%';" ^
     "$s.IconLocation = '%SystemRoot%\System32\shell32.dll,220';" ^
-    "$s.Description = 'ECG Analyzer V4';" ^
+    "$s.Description = 'ECG Analyzer V5';" ^
     "$s.Save()" >nul 2>nul
 
 if exist "%SHORTCUT%" (
-    echo [OK] 已在桌面建立「ECG Analyzer V4」捷徑
+    echo [OK] 已在桌面建立「ECG Analyzer V5」捷徑
 ) else (
-    echo [提示] 桌面捷徑建立失敗，可直接雙擊「啟動 ECG Analyzer V4.bat」開啟
+    echo [提示] 桌面捷徑建立失敗，可直接雙擊「啟動 ECG Analyzer V5.bat」開啟
 )
 
 echo.
 echo ================================================
 echo                安裝完成！
 echo ------------------------------------------------
-echo   雙擊桌面上的「ECG Analyzer V4」捷徑即可啟動
-echo   或雙擊「啟動 ECG Analyzer V4.bat」
+echo   雙擊桌面上的「ECG Analyzer V5」捷徑即可啟動
+echo   或雙擊「啟動 ECG Analyzer V5.bat」
 echo   也可將 .abf / .edf 檔案拖放到該檔案上直接開啟
 echo ================================================
 echo.
 
-set /p RUNNOW=是否立即開啟 ECG Analyzer V4？(y/n)
+set /p RUNNOW=是否立即開啟 ECG Analyzer V5？(y/n)
 if /i "%RUNNOW%"=="y" (
     call "%LAUNCHER%"
     echo 已啟動！

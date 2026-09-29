@@ -1,4 +1,4 @@
-# ECG Analyzer V4 (+SKNA)
+# ECG Analyzer V5 (+SKNA)
 ### .abf / .edf / .acq 心電圖與皮膚交感神經活性 (SKNA) 分析工具（支援 macOS 與 Windows）
 
 ---
@@ -6,13 +6,15 @@
 ## 📦 資料夾內容
 
 ```
-ECG Analyzer V4 (+SKNA)/
+ECG Analyzer V5 (+SKNA)/
 ├── ecg_app.py                         ← 主程式
+├── ECG Analyzer.app                   ← macOS：雙擊啟動（可拖到「應用程式」與 Dock）
+├── 更新 ECG Analyzer App.command       ← macOS：修改 ecg_app.py 後，雙擊更新 App
 ├── requirements.txt                   ← 套件需求清單
 ├── install.command                    ← macOS：第一次使用，雙擊安裝
-├── 啟動 ECG Analyzer V4.command        ← macOS：之後啟動用
+├── 啟動 ECG Analyzer V5.command        ← macOS：之後啟動用
 ├── install.bat                        ← Windows：第一次使用，雙擊安裝
-├── 啟動 ECG Analyzer V4.bat            ← Windows：之後啟動用
+├── 啟動 ECG Analyzer V5.bat            ← Windows：之後啟動用
 ├── SKNA raw data/                     ← 範例資料
 └── README.md                          ← 本說明文件
 ```
@@ -24,12 +26,14 @@ ECG Analyzer V4 (+SKNA)/
 ### macOS
 1. **雙擊 `install.command`**
 2. 若出現「無法開啟，因為無法驗證開發者」：按住 **Control** 再點擊 → 選「開啟」→ 再按「開啟」
-3. 之後直接雙擊 **`啟動 ECG Analyzer V4.command`**，或把檔案拖放到它上面
+3. 之後直接雙擊 **`ECG Analyzer.app`**（建議拖到「應用程式」資料夾，並在 Dock 上按右鍵 →「選項」→「保留在 Dock 中」），或把檔案拖放到 App 圖示上
+4. 修改 `ecg_app.py` 後，雙擊 **`更新 ECG Analyzer App.command`** 讓 App 使用最新程式
+5. 備用方式：雙擊 **`啟動 ECG Analyzer V5.command`**
 
 ### Windows
 1. 先安裝 **[Python 3.10 以上版本](https://www.python.org/downloads/)**（務必勾選 **「Add python.exe to PATH」**）
 2. **雙擊 `install.bat`**（SmartScreen 提示 → 「其他資訊」→「仍要執行」）
-3. 之後雙擊桌面捷徑或 **`啟動 ECG Analyzer V4.bat`**
+3. 之後雙擊桌面捷徑或 **`啟動 ECG Analyzer V5.bat`**
 
 > 手動安裝：`pip install -r requirements.txt` 然後 `python ecg_app.py`
 
@@ -391,4 +395,4 @@ A：macOS：`python3 -m pip install -r requirements.txt`；Windows：`py -m pip 
 
 ---
 
-*ECG Analyzer V4 (+SKNA) — 研究用途，不作為臨床診斷依據*
+*ECG Analyzer V5 (+SKNA) — 研究用途，不作為臨床診斷依據*

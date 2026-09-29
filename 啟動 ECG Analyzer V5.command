@@ -1,5 +1,5 @@
 #!/bin/bash
-# ECG Analyzer V4 啟動器
+# ECG Analyzer V5 啟動器
 # 支援 .abf 和 .edf 格式
 # 雙擊此檔案即可開啟（不需要 .app）
 

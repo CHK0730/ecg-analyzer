@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 """
-ECG Analyzer V4 — Main Application
+ECG Analyzer V5 — Main Application
 ====================================
 Mac App 主程式，使用 PyQt6 + pyqtgraph 建立原生視窗介面
 功能：
@@ -91,7 +91,7 @@ from pyqtgraph import PlotWidget, InfiniteLine, LinearRegionItem
 # ── pyqtgraph 全局設定 ────────────────────────────────────────────────────────
 pg.setConfigOptions(antialias=True, background='#0d1117', foreground='#e6edf3')
 
-APP_VERSION = 'V4 (+SKNA)'
+APP_VERSION = 'V5 (+SKNA)'
 
 
 def build_stamp() -> str:
@@ -304,6 +304,7 @@ def fmt_ms(sec: float) -> str:
 
 # 開檔對話框要停在哪個資料夾。優先用「目前開著的檔案」所在位置，
 # 沒有開檔（起始畫面）時用上一次成功開檔的位置，跨程式重啟也記得。
+# 設定儲存名稱沿用舊名，升級到 V5 後仍保留原本記住的資料夾等偏好設定
 _SETTINGS_ORG, _SETTINGS_APP = 'ECGAnalyzer', 'ECG Analyzer V4'
 
 
@@ -4091,7 +4092,7 @@ class DropZone(QWidget):
         icon.setStyleSheet('font-size: 72px;')
         lay.addWidget(icon)
 
-        title = QLabel('ECG Analyzer V4')
+        title = QLabel('ECG Analyzer V5')
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(
             f'color: {C["accent"]}; font-size: 28px; font-weight: bold; '
@@ -6184,7 +6185,7 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('ECG Analyzer V4')
+        self.setWindowTitle('ECG Analyzer V5')
         self.resize(1280, 780)
         # 允許視窗（連同裡面的 3 個波形圖＋底部 slider）縮到比較小的
         # 筆電螢幕也能完整顯示，避免因為子元件的最小尺寸加總起來太高，
@@ -6579,7 +6580,7 @@ class MainWindow(QMainWindow):
             self.main_widget.setVisible(True)
             self.toolbar.setVisible(True)
 
-            self.setWindowTitle(f'ECG Analyzer V4 — {name}')
+            self.setWindowTitle(f'ECG Analyzer V5 — {name}')
             info = self.ecg_data.info()
             dt_str = (f"  |  📅 {info['rec_date']}  🕐 {info['rec_time']} → {info['rec_end']}"
                       if info['rec_date'] != '—' else '')
@@ -7750,13 +7751,13 @@ S3 演算法（移除心電干擾）：
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName('ECG Analyzer V4')
+    app.setApplicationName('ECG Analyzer V5')
     # Dock / 視窗圖示（由 ECG Analyzer.app 傳入）
     _icon = os.environ.get('ECG_APP_ICON')
     if _icon and os.path.exists(_icon):
         from PyQt6.QtGui import QIcon
         app.setWindowIcon(QIcon(_icon))
-    app.setApplicationVersion('3.0')
+    app.setApplicationVersion('5.0')
     app.setOrganizationName('Lab Tools')
     app.setStyleSheet(STYLESHEET)
 
