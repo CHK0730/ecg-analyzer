@@ -1088,16 +1088,52 @@ class ACQData:
         for i, c in enumerate(chans):
             self.channels[i] = np.asarray(c.data, dtype=np.float64)
 
-        # 錄製起始時間：bioread 給的是 timezone-aware UTC，轉成本地時間後
-        # 去掉 tzinfo，讓下游的 datetime 運算跟 ABF/EDF 一致。
-        t0 = getattr(f, 'earliest_marker_created_at', None)
-        if isinstance(t0, datetime.datetime):
-            try:
-                if t0.tzinfo is not None:
-                    t0 = t0.astimezone().replace(tzinfo=None)
-                self._rec_datetime = t0
-            except Exception:
-                self._rec_datetime = None
+        # 錄製分段：AcqKnowledge 每次按下暫停再繼續，就會多一個 apnd 標記，
+        # 記錄「這一段從第幾個樣本開始、實際幾點幾分開始錄」。暫停期間沒有
+        # 存資料，所以檔案裡的連續時間軸跟時鐘時間會越差越多，
+        # 必須逐段對齊才能換算出正確的時鐘時間。
+        self._segments = self._read_segments(f)
+
+        if self._segments:
+            self._rec_datetime = self._segments[0][1]
+        else:
+            # 沒有分段資訊時退回最早的標記時間（舊行為）
+            t0 = self._to_local(getattr(f, 'earliest_marker_created_at', None))
+            self._rec_datetime = t0
+            if t0 is not None:
+                self._segments = [(0.0, t0)]
+
+    @staticmethod
+    def _to_local(dt_val):
+        """bioread 給的是 timezone-aware UTC，轉成本地時間後去掉 tzinfo，
+        讓下游的 datetime 運算跟 ABF/EDF 一致。"""
+        if not isinstance(dt_val, datetime.datetime):
+            return None
+        try:
+            if dt_val.tzinfo is not None:
+                dt_val = dt_val.astimezone().replace(tzinfo=None)
+            return dt_val
+        except Exception:
+            return None
+
+    def _read_segments(self, f) -> list:
+        """回傳 [(相對秒數, 該段開始的本地時間)]，依相對秒數排序。"""
+        segs = []
+        try:
+            markers = list(getattr(f, 'event_markers', None) or [])
+        except Exception:
+            return segs
+        sps = float(getattr(f, 'samples_per_second', 0) or 0) or float(self.fs)
+        for m in markers:
+            if str(getattr(m, 'type_code', '') or '').lower() != 'apnd':
+                continue
+            si = getattr(m, 'sample_index', None)
+            when = self._to_local(getattr(m, 'date_created_utc', None))
+            if si is None or when is None or not sps:
+                continue
+            segs.append((float(si) / sps, when))
+        segs.sort(key=lambda x: x[0])
+        return segs
 
     @staticmethod
     def _read_markers(f) -> list:
@@ -1152,11 +1188,49 @@ class ACQData:
     def rec_datetime(self):
         return self._rec_datetime
 
+    def _segment_index(self, rel_sec: float) -> int:
+        """rel_sec 落在第幾個錄製分段。"""
+        idx = 0
+        for i, (s_rel, _) in enumerate(self._segments):
+            if rel_sec >= s_rel:
+                idx = i
+            else:
+                break
+        return idx
+
+    def abs_datetime(self, rel_sec: float):
+        """相對秒數 → 實際時鐘時間（依所在分段的開始時間推算）。"""
+        if not self._segments:
+            return None
+        s_rel, s_dt = self._segments[self._segment_index(rel_sec)]
+        return s_dt + datetime.timedelta(seconds=rel_sec - s_rel)
+
+    def rel_from_datetime(self, target):
+        """實際時鐘時間 → 相對秒數。
+
+        落在暫停期間（兩段之間沒有資料）的時間，對到下一段的開頭。"""
+        if not self._segments:
+            return None
+        segs = self._segments
+        idx = 0
+        for i, (_, s_dt) in enumerate(segs):
+            if target >= s_dt:
+                idx = i
+        s_rel, s_dt = segs[idx]
+        rel = s_rel + (target - s_dt).total_seconds()
+        if idx + 1 < len(segs) and rel > segs[idx + 1][0]:
+            rel = segs[idx + 1][0]
+        return rel
+
+    @property
+    def segments(self) -> list:
+        return list(self._segments)
+
     def abs_time(self, rel_sec: float) -> str:
-        t0 = self._rec_datetime
-        if t0 is None:
+        t = self.abs_datetime(rel_sec)
+        if t is None:
             return fmt_hms(rel_sec)
-        return (t0 + datetime.timedelta(seconds=rel_sec)).strftime('%H:%M:%S.%f')[:-3]
+        return t.strftime('%H:%M:%S.%f')[:-3]
 
     def fs_of(self, ch: int) -> float:
         try:
@@ -1184,17 +1258,38 @@ class ACQData:
 
     def info(self) -> dict:
         rec = self._rec_datetime
-        end = (rec + datetime.timedelta(seconds=self.duration)) if rec else None
+        end = self.abs_datetime(self.duration) if rec else None
         return {
             'file':      os.path.basename(self.path),
             'fs':        self.fs,
             'duration':  self.duration,
             'channels':  self.n_ch,
-            'protocol':  'BIOPAC ACQ',
+            'protocol':  (f'BIOPAC ACQ（{len(self._segments)} 個錄製分段）'
+                          if len(self._segments) > 1 else 'BIOPAC ACQ'),
             'rec_date':  rec.strftime('%Y-%m-%d') if rec else '—',
             'rec_time':  rec.strftime('%H:%M:%S') if rec else '—',
             'rec_end':   end.strftime('%H:%M:%S') if end else '—',
         }
+
+
+# ── 相對秒數 ↔ 時鐘時間 ──────────────────────────────────────────────────────
+# ACQ 檔有暫停分段，不能直接用「起始時間 + 秒數」換算，
+# 所以統一經過這兩個函式：資料物件有自己的換算方法就用，否則線性推算。
+
+def data_abs_datetime(data, rel_sec: float):
+    fn = getattr(data, 'abs_datetime', None)
+    if callable(fn):
+        return fn(rel_sec)
+    t0 = getattr(data, 'rec_datetime', None)
+    return (t0 + datetime.timedelta(seconds=rel_sec)) if t0 else None
+
+
+def data_rel_from_datetime(data, target):
+    fn = getattr(data, 'rel_from_datetime', None)
+    if callable(fn):
+        return fn(target)
+    t0 = getattr(data, 'rec_datetime', None)
+    return (target - t0).total_seconds() if t0 else None
 
 
 # ── 工廠函數：依副檔名選擇讀取器 ─────────────────────────────────────────────
@@ -2940,7 +3035,7 @@ class ExcelImportDialog(QDialog):
                     if target < t0:
                         target += dt.timedelta(days=1)
                     abs_str = target.strftime('%H:%M:%S')
-                    t_sec   = (target - t0).total_seconds()
+                    t_sec   = data_rel_from_datetime(self.abf_data, target)
                     if dur and not (0 <= t_sec <= dur):
                         warn  = '⚠ 超出錄音範圍'
                         t_sec = max(0.0, min(dur, t_sec))
@@ -7358,7 +7453,7 @@ class MainWindow(QMainWindow):
 
         # 記錄時間資訊
         if rec_dt:
-            end_dt  = rec_dt + datetime.timedelta(seconds=dur)
+            end_dt  = data_abs_datetime(self.ecg_data, dur)
             info_str = f'{rec_dt.strftime("%H:%M:%S")} → {end_dt.strftime("%H:%M:%S")}   ({fmt_hms(dur)})'
         else:
             info_str = f'總長度：{fmt_hms(dur)}'
@@ -7427,9 +7522,9 @@ class MainWindow(QMainWindow):
             target = rec_dt.replace(hour=h, minute=m,
                                     second=int(s),
                                     microsecond=int((s % 1) * 1_000_000))
-            diff = (target - rec_dt).total_seconds()
-            if diff < 0: diff += 86400
-            return diff
+            if target < rec_dt:
+                target += datetime.timedelta(days=1)
+            return data_rel_from_datetime(self.ecg_data, target)
 
         def do_goto():
             t_sec = None
