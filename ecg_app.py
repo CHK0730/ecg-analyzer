@@ -1526,12 +1526,31 @@ def skna_effective_band(fs: float, bp_lo: float, bp_hi: float):
 
 def compute_skna(y: np.ndarray, fs: float, bp_lo: float = 500.0,
                  bp_hi: float = 1500.0, order: int = 4,
-                 env_ms: float = 100.0, notch: float = 0.0):
+                 env_ms: float = 100.0, notch: float = 0.0,
+                 bandpass: bool = True):
     """對一段訊號做 SKNA 處理。
 
     回傳 (rsna, env)：
       rsna — 零相位帶通後的訊號（論文中的 rSNA-BPF）
       env  — |rsna| 的移動平均包絡（類似 microneurography 的積分神經圖）
+
+    bandpass=False 時不做帶通，直接把輸入當成 rSNA。用在 S3 的輸出：
+    S3 分解出來的就已經是去除心電成分的 SKNA，不再套帶通。
+    """
+    y = np.asarray(y, dtype=np.float64)
+    if not bandpass:
+        if len(y) == 0 or fs <= 0:
+            return np.zeros_like(y), np.zeros_like(y)
+        if notch and notch > 0 and len(y) >= 16:
+            y = apply_notch(y, fs, notch)
+        n_env = max(1, int(round(env_ms / 1000.0 * fs)))
+        env = uniform_filter1d(np.abs(y), size=n_env, mode='nearest')
+        return y, env
+    return _compute_skna_bpf(y, fs, bp_lo, bp_hi, order, env_ms, notch)
+
+
+def _compute_skna_bpf(y, fs, bp_lo, bp_hi, order, env_ms, notch):
+    """compute_skna 的帶通版本（傳統 rSNA-BPF）。
 
     用 SOS 形式的 Butterworth：在 10 kHz 取樣下 500/5000 = 0.1 這種很小的
     正規化頻率，傳統 (b, a) 係數在 4 階以上會數值不穩定產生假振盪，
@@ -1562,16 +1581,19 @@ def compute_skna(y: np.ndarray, fs: float, bp_lo: float = 500.0,
 
 
 def skna_segment(data, ch: int, t0: float, t1: float, cfg: dict,
-                 pad_sec: float = 0.25, sig=None):
+                 pad_sec: float = 0.25, sig=None, bandpass=None):
     """取出 [t0, t1] 的 SKNA。
 
     實際濾波時左右各多取 pad_sec 秒再裁掉，避免濾波器邊緣暫態污染
     區間頭尾的數值（尤其影響短區間的 aSKNA）。
 
     sig 若有給，就用它取代原始通道資料（用來餵入 S3 分解後、已經不含
-    心電成分的訊號），取樣率仍沿用該通道的。
+    心電成分的訊號），取樣率仍沿用該通道的。S3 的輸出本身就是 SKNA，
+    所以給了 sig 時預設不再帶通（bandpass=None → 依 sig 自動決定）。
     回傳 (t, rsna, env)。
     """
+    if bandpass is None:
+        bandpass = sig is None
     fs = data.fs_of(ch)
     full = data.channels[ch] if sig is None else np.asarray(sig)
     n = len(full)
@@ -1589,7 +1611,7 @@ def skna_segment(data, ch: int, t0: float, t1: float, cfg: dict,
         full[sp:ep], fs,
         bp_lo=cfg.get('bp_lo', 500.0), bp_hi=cfg.get('bp_hi', 1500.0),
         order=cfg.get('order', 4), env_ms=cfg.get('env_ms', 100.0),
-        notch=cfg.get('notch', 0.0))
+        notch=cfg.get('notch', 0.0), bandpass=bandpass)
 
     a = s - sp
     b = a + (e - s)
@@ -1789,7 +1811,7 @@ def analyze_skna_interval(data, cfg: dict, t0: float, t1: float,
 
     回傳的 dict 中最多有兩組指標，方便互相對照：
       all — 傳統 BPF，使用區間內全部樣本（含 QRS，不做任何排除）
-      s3  — 先用 S3 移除心電成分、再套同一個帶通後的結果
+      s3  — S3 移除心電成分後的訊號直接計算（不再帶通）
     """
     ch = cfg['src_ch']
     fs = data.fs_of(ch)
@@ -1852,6 +1874,12 @@ def analyze_skna_interval(data, cfg: dict, t0: float, t1: float,
         crest = m_all['peak'] / max(m_all['aSKNA'], 1e-12)
         if crest > 60:
             flags.append('疑似突波雜訊')
+    # ACQ 暫停後續錄的接縫：前後兩段在時間上不連續，區間跨過去的話
+    # 等於把兩段不相干的訊號接在一起算
+    for s_rel, _dt in (getattr(data, 'segments', None) or [])[1:]:
+        if t0 < s_rel < t1:
+            flags.append('跨錄製暫停')
+            break
 
     return {
         'ok': True, 't0': t0, 't1': t1, 'dur': t1 - t0,
@@ -2498,13 +2526,14 @@ class SidePanel(QWidget):
         is_s3 = cfg.get('method') == 's3'
 
         self._set_kv(self.lbl_skna_method, '演算法',
-                     'S3 + 帶通' if is_s3 else '傳統帶通 (BPF)')
+                     'S3（不再帶通）' if is_s3 else '傳統帶通 (BPF)')
         self._set_kv(self.lbl_skna_src, '來源通道',
                      f'CH{src} {data.ch_names[src]}')
         self._set_kv(self.lbl_skna_ecg, 'ECG 參考',
                      f'CH{ecg_ch} {data.ch_names[ecg_ch]}')
         self._set_kv(self.lbl_skna_band, '帶通',
-                     f'{lo:.0f}–{hi:.0f} Hz' + ('  ⚠' if warn else ''))
+                     f'{lo:.0f}–{hi:.0f} Hz' + ('  ⚠' if warn else '')
+                     + ('（僅 BPF 欄位）' if is_s3 else ''))
         self._set_kv(self.lbl_skna_env, '包絡窗長', f"{cfg['env_ms']:.0f} ms")
         if not is_s3:
             txt, col = '未使用', C['dim']
@@ -2534,6 +2563,8 @@ class SidePanel(QWidget):
             head = f"{r.get('label') or f'區間 {i + 1}'}"
             if r.get('kind') == 'mark':
                 head = '📍 ' + head
+            elif r.get('kind') == 'auto':
+                head = '⏱ ' + head
             body = f"{fmt_hms(r['t0'])} → {fmt_hms(r['t1'])}　({dur:.1f} s)"
             if val is not None and np.isfinite(val):
                 body += f"\n{tag} aSKNA {val:.3f} {unit}"
@@ -3633,12 +3664,13 @@ class WaveformWidget(QWidget):
         a_win = float(np.abs(rsna).mean())
 
         tag = 'S3' if use_s3 else 'BPF'
+        band_txt = 'S3 輸出（未帶通）' if use_s3 else f'{lo:.0f}–{hi:.0f} Hz'
         label = (f'SKNA [{tag}]　CH{ch}: {self.data.ch_names[ch]}　'
-                 f'{lo:.0f}–{hi:.0f} Hz　({unit})　'
+                 f'{band_txt}　({unit})　'
                  f'視窗 aSKNA = {a_win:.3f} {unit}')
         if cfg.get('method') == 's3' and self.s3_sna is None:
             label += '　⚠ 尚未執行 S3 分解，顯示的是原始帶通結果'
-        if warn:
+        if warn and not use_s3:
             label += '　⚠ 已受 Nyquist 限制'
         self._set_ylabel(self.plot_wave2, label)
 
@@ -5154,6 +5186,8 @@ class SknaSettingsDialog(QDialog):
             '心率越高殘留越多。\n\n'
             'S3：改在「波形形態」上切——把每個心跳排成矩陣，用最佳奇異值收縮'
             '估出低秩的心電成分再減掉，得到不含心電干擾的 SKNA。'
+            'S3 的輸出直接拿來計算 aSKNA / iSKNA，不再套下方的帶通'
+            '（帶通設定只用於 BPF 欄位）。'
             '整檔需先執行一次分解（12 分鐘的檔約 15 秒）。\n\n'
             '前置高通：S3 分解前先濾掉基線漂移的截止頻率。\n\n'
             '鄰居數 K：非局部中位數用幾個相似心跳來估心電成分'
@@ -5161,7 +5195,7 @@ class SknaSettingsDialog(QDialog):
             '但也會開始削到 SKNA 本身；K 越大越保守。')
         vm = QVBoxLayout(grp_m); vm.setSpacing(6)
         self.rb_bpf = QRadioButton('傳統帶通（BPF）')
-        self.rb_s3  = QRadioButton('S3：先分解掉心電成分，再帶通')
+        self.rb_s3  = QRadioButton('S3：分解掉心電成分（輸出即 SKNA，不再帶通）')
         self._m_grp = QButtonGroup(self)
         self._m_grp.addButton(self.rb_bpf, 0)
         self._m_grp.addButton(self.rb_s3, 1)
@@ -5558,6 +5592,288 @@ class MarkPointDialog(QDialog):
         return self._result
 
 
+def make_auto_windows(duration: float, win: float, step: float,
+                      t_start: float = 0.0, t_end: float | None = None,
+                      count: int | None = None, drop_partial: bool = True):
+    """產生等間隔的分析區間 [(t0, t1), ...]。
+
+    win   — 每段長度（秒）
+    step  — 相鄰兩段起點的間距（秒）；等於 win 就是連續不重疊，
+            大於 win 是「每隔 step 秒取 win 秒」，小於 win 則會重疊
+    t_start / t_end — 範圍；t_end 省略就到檔案結尾
+    count — 最多幾段（None 表示不限，排到範圍結束為止）
+    drop_partial — 最後一段不足 win 時是否捨去（不捨去就截到範圍結尾）
+
+    起點用 t_start + k·step 算，而不是一直累加，避免浮點誤差累積到
+    後面幾百段時起點偏掉。
+    """
+    out = []
+    if win <= 0 or step <= 0 or duration <= 0:
+        return out
+    t_start = max(0.0, float(t_start))
+    t_end = duration if t_end is None else min(float(t_end), duration)
+    eps = 1e-9
+    k = 0
+    while True:
+        if count is not None and len(out) >= count:
+            break
+        a = t_start + k * step
+        if a >= t_end - eps:
+            break
+        b = a + win
+        if b > t_end + eps:
+            if drop_partial:
+                break
+            b = t_end
+        out.append((round(a, 6), round(b, 6)))
+        k += 1
+    return out
+
+
+class AutoWindowDialog(QDialog):
+    """自動分段：依固定長度與間隔，一次產生並計算多個 SKNA 區間。"""
+
+    _KEY = 'skna_auto_windows'
+
+    def __init__(self, parent, data):
+        super().__init__(parent)
+        self.setWindowTitle('自動分段計算 SKNA')
+        self.setModal(True)
+        self.setMinimumWidth(500)
+        self.setStyleSheet(_dialog_style())
+        self.data = data
+        self.duration = float(data.duration)
+        self._windows = []
+        self._build()
+        self._load()
+        self._update()
+
+    # ── 版面 ──────────────────────────────────────────────────────────────
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.setContentsMargins(16, 16, 16, 16)
+
+        grp_w = HelpGroupBox(
+            '分段方式',
+            '每段長度：每個分析區間有多長。\n\n'
+            '每隔：相鄰兩段起點之間的距離。\n'
+            '  • 與長度相同（例如 10 / 10）→ 連續、不重疊地切\n'
+            '  • 大於長度（例如 長度 10、每隔 60）→ 每分鐘取 10 秒\n'
+            '  • 小於長度（例如 長度 10、每隔 5）→ 互相重疊的滑動視窗')
+        g = QGridLayout(grp_w)
+        g.setSpacing(8)
+        self.spin_win = QDoubleSpinBox()
+        self.spin_win.setRange(0.1, 1e6); self.spin_win.setDecimals(1)
+        self.spin_win.setValue(10.0); self.spin_win.setSuffix(' 秒')
+        self.spin_step = QDoubleSpinBox()
+        self.spin_step.setRange(0.1, 1e6); self.spin_step.setDecimals(1)
+        self.spin_step.setValue(10.0); self.spin_step.setSuffix(' 秒')
+        self.chk_link = QCheckBox('與長度相同（連續不重疊）')
+        self.chk_link.setChecked(True)
+        g.addWidget(QLabel('每段長度：'), 0, 0); g.addWidget(self.spin_win, 0, 1)
+        g.addWidget(QLabel('每隔：'), 1, 0);     g.addWidget(self.spin_step, 1, 1)
+        g.addWidget(self.chk_link, 1, 2)
+        lay.addWidget(grp_w)
+
+        grp_r = HelpGroupBox(
+            '計算範圍',
+            '時間可以輸入秒數（例如 330.5）或 mm:ss / hh:mm:ss（例如 5:30）。\n'
+            '一律是從檔案開頭起算的相對時間。')
+        vr = QGridLayout(grp_r)
+        vr.setSpacing(8)
+        self.rb_all   = QRadioButton('整個檔案')
+        self.rb_total = QRadioButton('從起點開始，總共計算')
+        self.rb_count = QRadioButton('從起點開始，共計算')
+        self.rb_range = QRadioButton('指定時間區間')
+        self._r_grp = QButtonGroup(self)
+        for i, rb in enumerate((self.rb_all, self.rb_total,
+                                self.rb_count, self.rb_range)):
+            self._r_grp.addButton(rb, i)
+        self.rb_all.setChecked(True)
+
+        self.ed_start = QLineEdit('0')
+        self.ed_start.setPlaceholderText('秒數或 mm:ss')
+        self.spin_total = QDoubleSpinBox()
+        self.spin_total.setRange(0.1, 1e7); self.spin_total.setDecimals(1)
+        self.spin_total.setValue(min(1000.0, self.duration)); self.spin_total.setSuffix(' 秒')
+        self.spin_count = QSpinBox()
+        self.spin_count.setRange(1, 100000); self.spin_count.setValue(100)
+        self.spin_count.setSuffix(' 段')
+        self.ed_end = QLineEdit(f'{self.duration:.1f}')
+        self.ed_end.setPlaceholderText('秒數或 mm:ss')
+
+        vr.addWidget(self.rb_all, 0, 0, 1, 3)
+        vr.addWidget(self.rb_total, 1, 0); vr.addWidget(self.spin_total, 1, 1)
+        vr.addWidget(self.rb_count, 2, 0); vr.addWidget(self.spin_count, 2, 1)
+        vr.addWidget(self.rb_range, 3, 0)
+        rr = QHBoxLayout()
+        rr.addWidget(QLabel('到')); rr.addWidget(self.ed_end)
+        vr.addLayout(rr, 3, 1)
+        vr.addWidget(QLabel('起點：'), 4, 0)
+        vr.addWidget(self.ed_start, 4, 1)
+        self.lbl_start_note = QLabel('')
+        self.lbl_start_note.setStyleSheet(f'color:{C["dim"]};font-size:11px;')
+        vr.addWidget(self.lbl_start_note, 4, 2)
+        self.chk_partial = QCheckBox('最後不足一段長度時捨去')
+        self.chk_partial.setChecked(True)
+        vr.addWidget(self.chk_partial, 5, 0, 1, 3)
+        lay.addWidget(grp_r)
+
+        grp_o = QGroupBox('其他')
+        go = QGridLayout(grp_o)
+        go.setSpacing(8)
+        self.ed_prefix = QLineEdit('自動')
+        go.addWidget(QLabel('標籤前綴：'), 0, 0); go.addWidget(self.ed_prefix, 0, 1)
+        self.chk_clear = QCheckBox('先清除之前自動產生的區間')
+        self.chk_clear.setChecked(True)
+        go.addWidget(self.chk_clear, 1, 0, 1, 2)
+        lay.addWidget(grp_o)
+
+        self.lbl_prev = WrapLabel('')
+        self.lbl_prev.setStyleSheet(
+            f'color:{C["accent"]};font-size:12px;border:1px solid {C["border"]};'
+            f'border-radius:4px;padding:6px 8px;background:{C["panel"]};')
+        lay.addWidget(self.lbl_prev)
+
+        btn = QHBoxLayout(); btn.addStretch()
+        self.b_ok = QPushButton('產生並計算'); self.b_ok.setDefault(True)
+        self.b_ok.clicked.connect(self._on_ok)
+        b_no = QPushButton('取消'); b_no.clicked.connect(self.reject)
+        btn.addWidget(self.b_ok); btn.addWidget(b_no)
+        lay.addLayout(btn)
+
+        for w_ in (self.spin_win, self.spin_step, self.spin_total, self.spin_count):
+            w_.valueChanged.connect(self._update)
+        for w_ in (self.ed_start, self.ed_end):
+            w_.textChanged.connect(self._update)
+        for w_ in (self.rb_all, self.rb_total, self.rb_count, self.rb_range,
+                   self.chk_partial, self.chk_link):
+            w_.toggled.connect(self._update)
+        self.spin_win.valueChanged.connect(self._sync_link)
+        self.chk_link.toggled.connect(self._sync_link)
+        self.finished.connect(lambda *_: HelpBadge.close_all())
+
+    def _sync_link(self, *_):
+        linked = self.chk_link.isChecked()
+        self.spin_step.setEnabled(not linked)
+        if linked:
+            self.spin_step.setValue(self.spin_win.value())
+
+    # ── 記住上次的設定 ────────────────────────────────────────────────────
+    def _load(self):
+        try:
+            raw = QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(self._KEY, '')
+            s = json.loads(raw) if raw else {}
+        except Exception:
+            s = {}
+        if s:
+            self.spin_win.setValue(float(s.get('win', 10.0)))
+            self.chk_link.setChecked(bool(s.get('link', True)))
+            self.spin_step.setValue(float(s.get('step', 10.0)))
+            self.spin_total.setValue(float(s.get('total', self.spin_total.value())))
+            self.spin_count.setValue(int(s.get('count', 100)))
+            self.chk_partial.setChecked(bool(s.get('drop', True)))
+            self.ed_prefix.setText(str(s.get('prefix', '自動')))
+            self.chk_clear.setChecked(bool(s.get('clear', True)))
+            b = self._r_grp.button(int(s.get('mode', 0)))
+            if b is not None:
+                b.setChecked(True)
+        self._sync_link()
+
+    def _save(self):
+        s = {'win': self.spin_win.value(), 'step': self.spin_step.value(),
+             'link': self.chk_link.isChecked(),
+             'mode': self._r_grp.checkedId(),
+             'total': self.spin_total.value(), 'count': self.spin_count.value(),
+             'drop': self.chk_partial.isChecked(),
+             'prefix': self.ed_prefix.text(), 'clear': self.chk_clear.isChecked()}
+        try:
+            QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(
+                self._KEY, json.dumps(s))
+        except Exception:
+            pass
+
+    # ── 計算預覽 ──────────────────────────────────────────────────────────
+    def _compute(self):
+        """依目前的輸入產生區間清單。回傳 (windows, 錯誤訊息)。"""
+        mode = self._r_grp.checkedId()
+        win, step = self.spin_win.value(), self.spin_step.value()
+        dur = self.duration
+        start = 0.0
+        if mode != 0:
+            start = parse_time_str(self.ed_start.text())
+            if start is None:
+                return [], '起點時間無法解析。'
+            if not (0 <= start < dur):
+                return [], f'起點超出檔案範圍（0 – {dur:.1f} 秒）。'
+        end, count = None, None
+        if mode == 1:
+            end = start + self.spin_total.value()
+        elif mode == 2:
+            count = self.spin_count.value()
+        elif mode == 3:
+            end = parse_time_str(self.ed_end.text())
+            if end is None:
+                return [], '結束時間無法解析。'
+            if end <= start:
+                return [], '結束時間必須大於起點。'
+        wins = make_auto_windows(dur, win, step, start, end, count,
+                                 self.chk_partial.isChecked())
+        if not wins:
+            return [], '這個範圍放不下任何一段，請縮短每段長度或擴大範圍。'
+        return wins, ''
+
+    def _update(self, *_):
+        mode = self._r_grp.checkedId()
+        self.ed_start.setEnabled(mode != 0)
+        self.spin_total.setEnabled(mode == 1)
+        self.spin_count.setEnabled(mode == 2)
+        self.ed_end.setEnabled(mode == 3)
+        st = parse_time_str(self.ed_start.text())
+        self.lbl_start_note.setText(
+            f'（時鐘 {self.data.abs_time(st)}）' if (st is not None and mode != 0
+                                                and 0 <= st < self.duration)
+            else '')
+
+        wins, err = self._compute()
+        self._windows = wins
+        self.b_ok.setEnabled(bool(wins))
+        if err:
+            self.lbl_prev.setText('⚠ ' + err)
+            self.lbl_prev.setStyleSheet(
+                f'color:{C["yellow"]};font-size:12px;border:1px solid {C["border"]};'
+                f'border-radius:4px;padding:6px 8px;background:{C["panel"]};')
+            return
+        a, b = wins[0][0], wins[-1][1]
+        win, step = self.spin_win.value(), self.spin_step.value()
+        how = ('連續不重疊' if abs(step - win) < 1e-9
+               else (f'每隔 {step:g} 秒取 {win:g} 秒' if step > win
+                     else f'重疊 {win - step:g} 秒的滑動視窗'))
+        txt = (f'將產生 {len(wins)} 段（{how}），範圍 {fmt_hms(a)} → {fmt_hms(b)}'
+               f'（時鐘 {self.data.abs_time(a)} → {self.data.abs_time(b)}）')
+        last = wins[-1][1] - wins[-1][0]
+        if last < win - 1e-6:
+            txt += f'\n最後一段只有 {last:.1f} 秒。'
+        if len(wins) > 2000:
+            txt += '\n⚠ 段數很多，計算會花一些時間（可隨時取消）。'
+        self.lbl_prev.setText(txt)
+        self.lbl_prev.setStyleSheet(
+            f'color:{C["accent"]};font-size:12px;border:1px solid {C["border"]};'
+            f'border-radius:4px;padding:6px 8px;background:{C["panel"]};')
+
+    def _on_ok(self):
+        if not self._windows:
+            return
+        self._save()
+        self.accept()
+
+    def result_settings(self):
+        """回傳 (windows, 標籤前綴, 是否先清除舊的自動區間)。"""
+        return (list(self._windows), self.ed_prefix.text().strip() or '自動',
+                self.chk_clear.isChecked())
+
+
 def pair_marks_to_intervals(marks: list):
     """把時間點位配對成分析區間。
 
@@ -5652,6 +5968,8 @@ class SknaIntervalDialog(QDialog):
             '  ＋ 手動輸入 — 直接打起訖時間\n'
             '  ＋ 從時間戳記匯入 — 已存的、有起訖範圍的時間戳記\n'
             '  ＋ 目前顯示範圍 — 畫面上看到的那一段\n'
+            '  ⏱ 自動分段計算 — 設定每段長度、間隔與範圍（整檔、總長幾秒、'
+            '幾段、或指定起訖），一次產生並算完\n'
             '另外，SKNA 頁的時間點位配對出來的區間（前面有 📍）會自動出現在'
             '這裡，與側邊欄同步。\n\n'
             '複製數值：拖曳框選儲存格後按 ⌘C／Ctrl+C，貼到 Excel 欄位會自動'
@@ -5673,7 +5991,11 @@ class SknaIntervalDialog(QDialog):
         b_ts.clicked.connect(self._add_from_timestamps)
         b_view = QPushButton('＋ 目前顯示範圍')
         b_view.clicked.connect(self._add_from_view)
-        for b in (b_sel, b_man, b_ts, b_view):
+        b_auto = QPushButton('⏱ 自動分段計算…')
+        b_auto.setToolTip('設定每段長度與間隔（例如每 10 秒一段），\n'
+                          '一次對整個檔案或指定範圍產生區間並計算 SKNA')
+        b_auto.clicked.connect(self._add_auto)
+        for b in (b_sel, b_man, b_ts, b_view, b_auto):
             row1.addWidget(b)
         row1.addStretch()
         lay.addLayout(row1)
@@ -5821,6 +6143,55 @@ class SknaIntervalDialog(QDialog):
                 '單一時間點的戳記沒有長度，無法計算。')
             return
         self._rebuild_table()
+
+    def _add_auto(self):
+        d = self.mw.ecg_data
+        if d is None or self.mw.skna_cfg.get('src_ch') is None:
+            return
+        dlg = AutoWindowDialog(self, d)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        wins, prefix, clear = dlg.result_settings()
+        if not wins:
+            return
+
+        old = list(self.rows)
+        if clear:
+            self.rows = [r for r in self.rows if r.get('kind') != 'auto']
+        base = len(self.rows)
+        width = len(str(len(wins)))
+        for k, (a, b) in enumerate(wins, start=1):
+            self.rows.append({'label': f'{prefix} {k:0{width}d}',
+                              't0': float(a), 't1': float(b),
+                              'res': None, 'src': '', 'kind': 'auto'})
+
+        # 大量區間時在主執行緒逐段算，用進度對話框讓畫面不會像當掉，
+        # 也能中途取消（取消就還原成原本的清單）
+        prog = QProgressDialog('計算 SKNA…', '取消', 0, len(wins), self)
+        prog.setWindowTitle('自動分段計算')
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(300)
+        cancelled = False
+        for k in range(len(wins)):
+            if prog.wasCanceled():
+                cancelled = True
+                break
+            self._compute_row(base + k)
+            if k % 5 == 0:
+                prog.setValue(k)
+                prog.setLabelText(f'計算 SKNA… {k + 1} / {len(wins)}')
+                QApplication.processEvents()
+        prog.setValue(len(wins))
+        if cancelled:
+            self.rows = old
+            self._rebuild_table()
+            self.lbl_status.setText('已取消自動分段，清單維持原狀。')
+            return
+        self._rebuild_table()
+        self.lbl_status.setText(
+            self.lbl_status.text() +
+            f'　已自動產生 {len(wins)} 段：{fmt_hms(wins[0][0])} → '
+            f'{fmt_hms(wins[-1][1])}。')
 
     def _compute_row(self, i: int):
         d = self.mw.ecg_data
@@ -6223,7 +6594,7 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         ('', ''),
         ('■ S3 分解', ''),
         ('目前選用演算法',
-         'S3（分解掉心電成分後再帶通）' if cfg.get('method') == 's3'
+         'S3（分解掉心電成分，輸出不再帶通）' if cfg.get('method') == 's3'
          else '傳統帶通 BPF'),
     ] + (
         [('S3 執行範圍',
@@ -6248,8 +6619,9 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         ('Peak', '區間內 |rSNA| 的最大值'),
         ('SD', 'rSNA 的標準差'),
         ('BPF 前綴的欄位', '原始訊號直接帶通後算出的指標，區間內全部樣本都計入'),
-        ('S3 前綴的欄位', '先用 S3 分解掉心電成分、再套同一個帶通後算出的同名'
-                   '指標，可直接與 BPF 那組對照'),
+        ('S3 前綴的欄位', 'S3 分解掉心電成分後的輸出直接計算的同名指標，'
+                   '不再套帶通（只有 S3 前置高通與慢速漂移移除），'
+                   '因此頻寬比 BPF 那組寬，數值不能直接等同'),
         ('無效訊號 (%)', '該區間內沒有有效訊號的樣本比例：放大器滿格（波形被'
                         '削平）或完全沒有變化。那些區段不含訊號內容，'
                         '數值不具物理意義'),
