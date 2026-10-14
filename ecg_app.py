@@ -2693,6 +2693,13 @@ class SidePanel(QWidget):
         self._set_kv(self.lbl_fs,   '取樣率', fs_txt)
         self._set_kv(self.lbl_dur,  '總長度', fmt_hms(data.duration))
         self._set_kv(self.lbl_ch,   '通道數', f'{data.n_ch}  [{ext}]')
+        try:
+            info = data.info()
+        except Exception:
+            info = {}
+        self._set_kv(self.lbl_rec_date,  '記錄日期', info.get('rec_date', '—'))
+        self._set_kv(self.lbl_rec_start, '開始時間', info.get('rec_time', '—'))
+        self._set_kv(self.lbl_rec_end,   '結束時間', info.get('rec_end', '—'))
 
     def update_view(self, t0: float, t1: float):
         self._set_kv(self.lbl_view_start, '起點', fmt_hms(t0))
