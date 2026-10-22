@@ -77,7 +77,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QSize, QRect, QRectF, QPoint, QPointF,
-    QSettings,
+    QSettings, QEvent,
 )
 from PyQt6.QtGui import (
     QAction, QIcon, QFont, QFontMetrics, QColor, QPalette, QDragEnterEvent,
@@ -1371,6 +1371,8 @@ SKNA_DEFAULTS = {
     's3_hp_hz':      1.0,      # S3 前置高通截止 (Hz)
     's3_K':          30,       # S3 非局部中位數鄰居數
     's3_detrend':    True,     # S3 後移除慢速漂移
+    'nact_compat':   True,     # 另外輸出 Nerveact 相容的 aSKNA（逐窗單向濾波）
+    'nact_win':      10.0,     # Nerveact 相容模式的切窗長度 (s)
 }
 
 
@@ -1646,6 +1648,48 @@ def skna_metrics(rsna: np.ndarray, fs: float, scale: float = 1.0) -> dict:
     }
 
 
+def skna_nerveact_compat(data, ch: int, t0: float, t1: float, cfg: dict):
+    """Nerveact 相容的 rSNA（只用來和 Nerveact 的數值對照）。
+
+    由 HFD2-1／4／5 的原始資料與 Nerveact 輸出反推（600 個窗格逐窗重現，
+    誤差 < 0.001 µV，即 Nerveact 輸出的小數第三位捨入）：
+      1. 從區間起點依 nact_win（預設 10 s）切窗
+      2. 每一窗「各自」用 Butterworth 帶通單向濾波（sosfilt），從零狀態開始
+      3. 全波整流後取平均 → aSKNA
+
+    與 _compute_skna_bpf 的差別：
+      • 每窗起點的直流電位等於一個階躍輸入，會激起濾波器暫態並被算進
+        aSKNA（約每 10 mV 直流偏移 +0.45 µV）；完全飽和的窗格會得到
+        0.450（500–1000 Hz）／0.429（500–1500 Hz）而不是 0。
+      • 單向濾波的 −3 dB 通帶就是設定值，零相位（sosfiltfilt）會把通帶
+        收窄，所以本函式的數值約高 6–10%。
+    不套用工頻陷波、不做前後延伸。回傳 (rsna, 窗數)。
+    """
+    from scipy.signal import sosfilt
+    fs = data.fs_of(ch)
+    full = data.channels[ch]
+    n = len(full)
+    s = max(0, int(round(t0 * fs)))
+    e = min(n, int(round(t1 * fs)))
+    if e - s < 16 or fs <= 0:
+        return np.zeros(0), 0
+    lo, hi, _ = skna_effective_band(fs, cfg.get('bp_lo', 500.0),
+                                    cfg.get('bp_hi', 1500.0))
+    nyq = fs / 2.0
+    sos = butter(int(cfg.get('order', 4)), [lo / nyq, hi / nyq],
+                 btype='band', output='sos')
+    L = max(16, int(round(float(cfg.get('nact_win', 10.0)) * fs)))
+    parts = []
+    for a in range(s, e, L):
+        b = min(e, a + L)
+        if b - a < 16:          # 尾端不到 16 個樣本，濾波沒有意義
+            break
+        parts.append(sosfilt(sos, np.asarray(full[a:b], dtype=np.float64)))
+    if not parts:
+        return np.zeros(0), 0
+    return np.concatenate(parts), len(parts)
+
+
 def estimate_rr_period(energy: np.ndarray, fs: float,
                        rr_min: float = 0.04, rr_max: float = 3.0):
     """用自相關估計心動週期（秒）。找不到就回傳 None。
@@ -1839,6 +1883,13 @@ def analyze_skna_interval(data, cfg: dict, t0: float, t1: float,
         if len(rsna3):
             m_s3 = skna_metrics(rsna3, fs, scale)
 
+    m_nact = {}
+    if cfg.get('nact_compat'):
+        rsna_n, n_win = skna_nerveact_compat(data, ch, t0, t1, cfg)
+        if len(rsna_n):
+            m_nact = skna_metrics(rsna_n, fs, scale)
+            m_nact['n_win'] = n_win
+
     hr = np.nan
     rr_cv = np.nan
     n_beat = 0
@@ -1884,7 +1935,7 @@ def analyze_skna_interval(data, cfg: dict, t0: float, t1: float,
     return {
         'ok': True, 't0': t0, 't1': t1, 'dur': t1 - t0,
         'unit': unit_lbl, 'fs': fs,
-        'all': m_all, 's3': m_s3,
+        'all': m_all, 's3': m_s3, 'nact': m_nact,
         'hr': hr, 'rr_cv': rr_cv, 'n_beat': n_beat,
         'sat_pct': sat_pct, 'flat_pct': flat_pct, 'bad_pct': bad_pct,
         'flags': flags,
@@ -2192,6 +2243,7 @@ class SidePanel(QWidget):
     skna_add_requested       = pyqtSignal()      # 節錄目前選取範圍
     skna_delete_requested    = pyqtSignal(list)  # 刪除選取的 SKNA 區間
     skna_goto_index          = pyqtSignal(int)   # 跳到第 n 段 SKNA 區間
+    skna_review_requested    = pyqtSignal()      # 開啟 Artifact 逐段判讀
     skna_goto                = pyqtSignal(float) # 跳到指定時間
     page_requested           = pyqtSignal(int)   # 切換 ECG / SKNA 頁
     s3_run_requested         = pyqtSignal(bool)  # 執行 S3（True=整檔）
@@ -2476,6 +2528,13 @@ class SidePanel(QWidget):
             lambda: self.skna_intervals_requested.emit())
         sb_row.addWidget(self.btn_skna_open)
         si_lay.addLayout(sb_row)
+        self.btn_skna_review = QPushButton("Artifact")
+        self.btn_skna_review.setToolTip(
+            '依序檢視每一段 SKNA 波形，人工判讀為「保留」或「Artifact」\n'
+            '（預設保留；僅用於傳統帶通 BPF；判讀結果會寫進匯出的 Excel 總表）')
+        self.btn_skna_review.clicked.connect(
+            lambda: self.skna_review_requested.emit())
+        si_lay.addWidget(self.btn_skna_review)
 
         self.lbl_skna_hint = QLabel('')
         self.lbl_skna_hint.setWordWrap(True)
@@ -2571,9 +2630,15 @@ class SidePanel(QWidget):
                 if ival is not None and np.isfinite(ival):
                     # 另起一行：側邊欄只有約 340 px，跟 aSKNA 擠同一行會被截斷
                     body += f"\n{tag} iSKNA {ival:.2f} {unit}·s"
+            na = res.get('nact', {}) if res.get('ok') else {}
+            nv = na.get('aSKNA')
+            if nv is not None and np.isfinite(nv):
+                body += f"\nNerveact aSKNA {nv:.3f} {unit}"
             flags = res.get('flags', [])
             if flags:
                 body += f"\n⚠ {'、'.join(flags)}"
+            if r.get('judge') == 'artifact':
+                head = '✗ ' + head + '　[Artifact]'
             text = f"{head}\n{body}"
             it = QListWidgetItem(text)
             it.setData(Qt.ItemDataRole.UserRole, i)
@@ -2581,7 +2646,9 @@ class SidePanel(QWidget):
             # （aSKNA／警示）會被截成省略號
             fm = self.skna_list.fontMetrics()
             it.setSizeHint(QSize(0, fm.lineSpacing() * (text.count('\n') + 1) + 10))
-            if flags:
+            if r.get('judge') == 'artifact':
+                it.setForeground(QColor(C['red']))
+            elif flags:
                 it.setForeground(QColor(C['yellow']))
             self.skna_list.addItem(it)
         if rows:
@@ -3164,6 +3231,9 @@ class WaveformWidget(QWidget):
         self.mark_mode    = False   # SKNA 時間點位標記模式
         self.marks        = []      # [{'t','name','kind'}]
         self._mark_items  = []
+        self.review_regions = []      # [(t0, t1, 'artifact'|'keep'|None)]
+        self.review_cur     = None    # 目前判讀中的 (t0, t1)
+        self._review_items  = []
         self.peak_edit_mode = False
         self.line_a: InfiniteLine | None = None
         self._peaks_cache    = None
@@ -3602,6 +3672,7 @@ class WaveformWidget(QWidget):
         self._update_measure_lines()
         self._draw_timestamps()
         self._draw_marks()
+        self._draw_review()
         self._update_slider()
         self.view_changed.emit(t0, t1)
         self._last_draw_ms = (time.perf_counter() - _t_begin) * 1000.0
@@ -4145,6 +4216,55 @@ class WaveformWidget(QWidget):
             self._line_a.setVisible(False)
             self._line_b.setVisible(False)
             self._region_meas.setVisible(False)
+
+    def show_range(self, a: float, b: float):
+        """把檢視範圍設成 [a, b]（會夾在檔案範圍內）。"""
+        if self.data is None:
+            return
+        dur = self.data.duration
+        w = max(0.05, min(dur, b - a))
+        a = max(0.0, min(a, dur - w))
+        self.t_start = a
+        self.t_end = a + w
+        self._draw()
+
+    def set_review(self, regions: list, cur=None):
+        self.review_regions = list(regions or [])
+        self.review_cur = cur
+        self._draw_review()
+
+    def _draw_review(self):
+        """Artifact 區段畫紅色底，目前判讀中的區段畫橘色框。"""
+        for item, container in self._review_items:
+            try:
+                container.removeItem(item)
+            except Exception:
+                pass
+        self._review_items = []
+        if self.data is None or (not self.review_regions and self.review_cur is None):
+            return
+        v0, v1 = self.t_start, self.t_end
+        plots = [self.plot_wave]
+        if self.dual_mode and self.plot_wave2.isVisible():
+            plots.append(self.plot_wave2)
+        spans = [(a, b, pg.mkBrush(248, 81, 73, 55), None)
+                 for a, b, st in self.review_regions
+                 if st == 'artifact' and b > v0 and a < v1]
+        if self.review_cur is not None:
+            a, b = self.review_cur
+            spans.append((a, b, pg.mkBrush(255, 166, 87, 28),
+                          pg.mkPen(C['orange'], width=2)))
+        for a, b, brush, pen in spans:
+            for plot in plots:
+                reg = LinearRegionItem(values=(a, b), movable=False, brush=brush)
+                reg.setZValue(-10)
+                reg.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                for ln in reg.lines:
+                    ln.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    ln.setPen(pen if pen is not None else pg.mkPen(None))
+                    ln.setHoverPen(pen if pen is not None else pg.mkPen(None))
+                plot.addItem(reg)
+                self._review_items.append((reg, plot))
 
     def set_marks(self, marks: list):
         self.marks = list(marks or [])
@@ -5297,6 +5417,40 @@ class SknaSettingsDialog(QDialog):
         v.addWidget(self.lbl_hint)
         lay.addWidget(grp_bp)
 
+        grp_na = HelpGroupBox(
+            'Nerveact 相容模式',
+            '開啟後，每個區間會「另外」多算一組 Nerveact 相容的 aSKNA / iSKNA，'
+            '原本的 BPF 與 S3 數值不受影響。\n\n'
+            'Nerveact 的計算方式（由原始資料與 Nerveact 輸出反推，600 個窗格'
+            '逐窗重現，誤差 < 0.001 µV）：\n'
+            '  1. 從區間起點依窗長（預設 10 s）切窗\n'
+            '  2. 每一窗各自以 Butterworth 帶通「單向」濾波，從零狀態開始\n'
+            '  3. 全波整流後取平均\n\n'
+            '與本程式 BPF 的差異：\n'
+            '  • 每窗起點的直流電位會激起濾波器暫態並被算進 aSKNA'
+            '（約每 10 mV 直流偏移 +0.45 µV）。放大器飽和的窗格會得到 '
+            '0.450（500–1000 Hz）／0.429（500–1500 Hz）而不是 0。\n'
+            '  • 單向濾波的通帶比零相位寬，數值約高 6–10%。\n\n'
+            '用途：與 Nerveact 數據或以 Nerveact 分析的文獻數值對照。'
+            '這個數值含有直流偏移造成的暫態，不建議當作主要分析指標。\n\n'
+            '要和 Nerveact 逐窗對齊：區間長度設成與窗長相同（例如「自動分段'
+            '計算」每 10 s 一段），起點也要和 Nerveact 相同。帶通頻率與階數'
+            '沿用上方設定（Nerveact 為 4 階）；不套用工頻陷波。')
+        hn = QHBoxLayout(grp_na)
+        self.chk_nact = QCheckBox('另外計算 Nerveact 相容的 aSKNA')
+        self.chk_nact.setChecked(bool(self._cfg.get('nact_compat', True)))
+        self.spin_nact = QDoubleSpinBox(); self.spin_nact.setRange(0.5, 600.0)
+        self.spin_nact.setDecimals(1); self.spin_nact.setSingleStep(1.0)
+        self.spin_nact.setValue(float(self._cfg.get('nact_win', 10.0)))
+        self.spin_nact.setEnabled(self.chk_nact.isChecked())
+        self.chk_nact.toggled.connect(self.spin_nact.setEnabled)
+        hn.addWidget(self.chk_nact)
+        hn.addSpacing(12)
+        hn.addWidget(QLabel('切窗長度')); hn.addWidget(self.spin_nact)
+        hn.addWidget(QLabel('s'))
+        hn.addStretch()
+        lay.addWidget(grp_na)
+
         grp_env = HelpGroupBox(
             '整流與包絡',
             'rSNA 全波整流後取移動平均，得到軌道 2 上那條橘色包絡線，'
@@ -5453,6 +5607,8 @@ class SknaSettingsDialog(QDialog):
             's3_hp_hz':      self.spin_s3_hp.value(),
             's3_K':          int(self.spin_s3_K.value()),
             's3_detrend':    self.chk_s3_dt.isChecked(),
+            'nact_compat':   self.chk_nact.isChecked(),
+            'nact_win':      self.spin_nact.value(),
         })
         return cfg
 
@@ -5642,9 +5798,11 @@ class AutoWindowDialog(QDialog):
 
     _KEY = 'skna_auto_windows'
 
-    def __init__(self, parent, data):
+    def __init__(self, parent, data, points=None):
         super().__init__(parent)
         self.setWindowTitle('自動分段計算 SKNA')
+        # [(t, 顯示文字, 名稱, 'start'|'end'|'')] —— SKNA 時間點位與時間戳記
+        self.points = sorted(points or [], key=lambda p: p[0])
         self.setModal(True)
         self.setMinimumWidth(500)
         self.setStyleSheet(_dialog_style())
@@ -5686,7 +5844,10 @@ class AutoWindowDialog(QDialog):
         grp_r = HelpGroupBox(
             '計算範圍',
             '時間可以輸入秒數（例如 330.5）或 mm:ss / hh:mm:ss（例如 5:30）。\n'
-            '一律是從檔案開頭起算的相對時間。')
+            '一律是從檔案開頭起算的相對時間。\n\n'
+            '起點／終點旁的下拉選單可以直接選已標記的時間：📍 是 SKNA 時間點位，'
+            '🕒 是時間戳記。選了起點而它有同名的終點時，終點會自動帶入，'
+            '並切換成「指定時間區間」。')
         vr = QGridLayout(grp_r)
         vr.setSpacing(8)
         self.rb_all   = QRadioButton('整個檔案')
@@ -5713,18 +5874,27 @@ class AutoWindowDialog(QDialog):
         vr.addWidget(self.rb_all, 0, 0, 1, 3)
         vr.addWidget(self.rb_total, 1, 0); vr.addWidget(self.spin_total, 1, 1)
         vr.addWidget(self.rb_count, 2, 0); vr.addWidget(self.spin_count, 2, 1)
+        self.combo_pt_start = self._point_combo('起點')
+        self.combo_pt_end = self._point_combo('終點')
         vr.addWidget(self.rb_range, 3, 0)
         rr = QHBoxLayout()
         rr.addWidget(QLabel('到')); rr.addWidget(self.ed_end)
-        vr.addLayout(rr, 3, 1)
+        rr.addWidget(self.combo_pt_end, 1)
+        vr.addLayout(rr, 3, 1, 1, 2)
         vr.addWidget(QLabel('起點：'), 4, 0)
-        vr.addWidget(self.ed_start, 4, 1)
+        rs = QHBoxLayout()
+        rs.addWidget(self.ed_start); rs.addWidget(self.combo_pt_start, 1)
+        vr.addLayout(rs, 4, 1, 1, 2)
         self.lbl_start_note = QLabel('')
         self.lbl_start_note.setStyleSheet(f'color:{C["dim"]};font-size:11px;')
-        vr.addWidget(self.lbl_start_note, 4, 2)
+        vr.addWidget(self.lbl_start_note, 5, 1, 1, 2)
         self.chk_partial = QCheckBox('最後不足一段長度時捨去')
         self.chk_partial.setChecked(True)
-        vr.addWidget(self.chk_partial, 5, 0, 1, 3)
+        vr.addWidget(self.chk_partial, 6, 0, 1, 3)
+        self.combo_pt_start.activated.connect(self._on_pick_start)
+        self.combo_pt_end.activated.connect(self._on_pick_end)
+        self.ed_start.textEdited.connect(lambda *_: self.combo_pt_start.setCurrentIndex(0))
+        self.ed_end.textEdited.connect(lambda *_: self.combo_pt_end.setCurrentIndex(0))
         lay.addWidget(grp_r)
 
         grp_o = QGroupBox('其他')
@@ -5760,6 +5930,45 @@ class AutoWindowDialog(QDialog):
         self.spin_win.valueChanged.connect(self._sync_link)
         self.chk_link.toggled.connect(self._sync_link)
         self.finished.connect(lambda *_: HelpBadge.close_all())
+
+    def _point_combo(self, what: str) -> QComboBox:
+        cb = QComboBox()
+        if self.points:
+            cb.addItem(f'從已標記的時間選{what}…', None)
+            for t, text, _n, _k in self.points:
+                cb.addItem(text, float(t))
+        else:
+            cb.addItem('（尚無時間點位／時間戳記）', None)
+            cb.setEnabled(False)
+        cb.setToolTip('📍 SKNA 時間點位　🕒 時間戳記')
+        return cb
+
+    def _on_pick_start(self, idx: int):
+        t = self.combo_pt_start.itemData(idx)
+        if t is None:
+            return
+        self.ed_start.setText(f'{t:.3f}')
+        # 有同名的終點就一併帶入
+        _t, _txt, name, kind = self.points[idx - 1]
+        if kind == 'start' and name:
+            ends = [k for k, p in enumerate(self.points)
+                    if p[2] == name and p[3] == 'end' and p[0] > t]
+            if ends:
+                k = min(ends, key=lambda k: self.points[k][0])
+                self.ed_end.setText(f'{self.points[k][0]:.3f}')
+                self.combo_pt_end.setCurrentIndex(k + 1)
+                self.rb_range.setChecked(True)
+        if self._r_grp.checkedId() == 0:
+            self.rb_range.setChecked(True)
+        self._update()
+
+    def _on_pick_end(self, idx: int):
+        t = self.combo_pt_end.itemData(idx)
+        if t is None:
+            return
+        self.ed_end.setText(f'{t:.3f}')
+        self.rb_range.setChecked(True)
+        self._update()
 
     def _sync_link(self, *_):
         linked = self.chk_link.isChecked()
@@ -5918,10 +6127,215 @@ def pair_marks_to_intervals(marks: list):
     return intervals, unpaired
 
 
+# ── Artifact 判讀 ───────────────────────────────────────────────────────────
+# 判讀結果以「起訖時間」為鍵存在 MainWindow.skna_judge（並寫進
+# 檔名_SKNA_marks.json），不綁在區間物件上：重新自動分段、換帶通重算，
+# 只要區段起訖相同，判讀就會自動套回去。
+# 預設一律「保留」，只記錄被判為 Artifact 的區段。
+JUDGE_LABEL = {'artifact': 'Artifact', 'keep': '保留', None: '保留'}
+
+
+def judge_key(t0: float, t1: float) -> str:
+    return f'{float(t0):.3f}-{float(t1):.3f}'
+
+
+class ArtifactReviewDialog(QDialog):
+    """逐段檢視 SKNA 區間，人工判讀為「保留」或「Artifact」。
+
+    只用於傳統帶通（BPF）；S3 已經把心電成分分解掉，不需要這一步。
+    主視窗會跟著跳到每一段（前後各多顯示一點），並把目前這段框起來。
+    """
+    MARGIN = 1.0   # 前後多顯示的秒數
+
+    def __init__(self, main_window, start: int = 0):
+        super().__init__(main_window, Qt.WindowType.Tool)
+        self.mw = main_window
+        self.setWindowTitle('Artifact')
+        self.setModal(False)
+        self.setStyleSheet(_dialog_style())
+        self.i = 0
+        self._build()
+        self.goto(start)
+
+    # ── UI ──
+    def _build(self):
+        lay = QVBoxLayout(self); lay.setSpacing(8)
+        lay.setContentsMargins(14, 12, 14, 12)
+        top = QHBoxLayout(); top.setSpacing(6)
+        self.lbl_pos = QLabel('')
+        self.lbl_pos.setStyleSheet(f'color:{C["accent"]};font-size:15px;font-weight:bold;')
+        top.addWidget(self.lbl_pos)
+        top.addStretch()
+        top.addWidget(HelpBadge(
+            '逐段檢視 SKNA 波形（傳統帶通 BPF），每段預設為「保留」，'
+            '看到 artifact 就標記為 Artifact。\n\n'
+            '快捷鍵：\n'
+            '  K／空白鍵　保留\n'
+            '  A／X　　　Artifact\n'
+            '  ←／→　　 上一段／下一段\n'
+            '  Esc　　　 完成\n\n'
+            '判讀結果會自動存檔（檔名_SKNA_marks.json），以區段起訖時間對應；'
+            '重新分段或改帶通重算後，起訖相同的區段仍會套用。'
+            '匯出 Excel 時，總表會分別列出全部區間與排除 Artifact 後的統計。',
+            self))
+        lay.addLayout(top)
+        self.lbl_time = QLabel('')
+        self.lbl_time.setStyleSheet(f'color:{C["text"]};font-size:12px;')
+        lay.addWidget(self.lbl_time)
+        self.lbl_vals = WrapLabel('')
+        self.lbl_vals.setStyleSheet(f'color:{C["dim"]};font-size:12px;')
+        lay.addWidget(self.lbl_vals)
+        self.lbl_state = QLabel('')
+        self.lbl_state.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(self.lbl_state)
+
+        def btn(text, tip, fn, obj=None):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # 讓快捷鍵不被按鈕吃掉
+            if obj:
+                b.setObjectName(obj)
+            b.clicked.connect(fn)
+            return b
+
+        r1 = QHBoxLayout(); r1.setSpacing(6)
+        r1.addWidget(btn('◀ 上一段', '←', lambda: self.goto(self.i - 1)))
+        self.b_keep = btn('✓ 保留  (K)', 'K 或空白鍵', lambda: self.judge('keep'))
+        self.b_art = btn('✗ Artifact  (A)', 'A 或 X', lambda: self.judge('artifact'),
+                         'btn_danger')
+        r1.addWidget(self.b_keep); r1.addWidget(self.b_art)
+        r1.addWidget(btn('下一段 ▶', '→', lambda: self.goto(self.i + 1)))
+        lay.addLayout(r1)
+
+        r2 = QHBoxLayout(); r2.setSpacing(6)
+        self.chk_auto = QCheckBox('判讀後自動跳到下一段')
+        self.chk_auto.setChecked(True)
+        self.chk_auto.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        r2.addWidget(self.chk_auto)
+        r2.addStretch()
+        r2.addWidget(btn('完成', 'Esc', self.close))
+        lay.addLayout(r2)
+
+        self.lbl_count = QLabel('')
+        self.lbl_count.setStyleSheet(f'color:{C["dim"]};font-size:11px;')
+        lay.addWidget(self.lbl_count)
+
+        K = Qt.Key
+        self._keymap = {
+            K.Key_K: lambda: self.judge('keep'),
+            K.Key_Space: lambda: self.judge('keep'),
+            K.Key_A: lambda: self.judge('artifact'),
+            K.Key_X: lambda: self.judge('artifact'),
+            K.Key_Left: lambda: self.goto(self.i - 1),
+            K.Key_Right: lambda: self.goto(self.i + 1),
+        }
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMinimumWidth(460)
+
+    # 這個視窗是主視窗的 Tool 子視窗，主視窗的快捷鍵（K＝SKNA 開關、
+    # R、P…）在這裡也會生效。先在 ShortcutOverride 階段把判讀用的按鍵
+    # 攔下來，按鍵才會交給這個視窗，而不是去觸發主視窗的功能。
+    def event(self, e):
+        if e.type() == QEvent.Type.ShortcutOverride and \
+                e.modifiers() == Qt.KeyboardModifier.NoModifier and \
+                e.key() in self._keymap:
+            e.accept()
+            return True
+        return super().event(e)
+
+    def keyPressEvent(self, e):
+        fn = self._keymap.get(e.key()) \
+            if e.modifiers() == Qt.KeyboardModifier.NoModifier else None
+        if fn is not None and not e.isAutoRepeat():
+            fn()
+            e.accept()
+            return
+        if fn is not None:
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+    # ── 邏輯 ──
+    @property
+    def rows(self):
+        return self.mw.skna_rows
+
+    def _state(self, i):
+        r = self.rows[i]
+        return ('artifact' if self.mw.skna_judge.get(judge_key(r['t0'], r['t1']))
+                == 'artifact' else 'keep')
+
+    def goto(self, i: int):
+        n = len(self.rows)
+        if n == 0:
+            self.close()
+            return
+        self.i = max(0, min(n - 1, int(i)))
+        r = self.rows[self.i]
+        self.mw._review_cur = (r['t0'], r['t1'])
+        self.mw.waveform.show_range(r['t0'] - self.MARGIN, r['t1'] + self.MARGIN)
+        self.mw._update_review_overlay()
+        try:
+            self.mw.side.skna_list.setCurrentRow(self.i)
+        except Exception:
+            pass
+        self._refresh()
+
+    def judge(self, state):
+        if not self.rows:
+            return
+        self.mw.skna_set_judge([self.i], state)
+        if self.chk_auto.isChecked() \
+                and self.i < len(self.rows) - 1:
+            self.goto(self.i + 1)
+        else:
+            self.goto(self.i)
+
+    def _refresh(self):
+        n = len(self.rows)
+        r = self.rows[self.i]
+        res = r.get('res') or {}
+        a = res.get('all', {}) if res.get('ok') else {}
+        na = res.get('nact', {}) if res.get('ok') else {}
+        unit = res.get('unit', 'µV')
+        self.lbl_pos.setText(f'第 {self.i + 1} / {n} 段　｜　{r.get("label", "")}')
+        self.lbl_time.setText(f"{fmt_hms(r['t0'])} → {fmt_hms(r['t1'])}"
+                              f"（{r['t1'] - r['t0']:.1f} s）")
+        parts = []
+        if a.get('aSKNA') is not None:
+            parts.append(f"BPF aSKNA {a['aSKNA']:.3f} {unit}")
+        if na.get('aSKNA') is not None:
+            parts.append(f"Nerveact aSKNA {na['aSKNA']:.3f} {unit}")
+        flags = res.get('flags', [])
+        if flags:
+            parts.append('⚠ ' + '、'.join(flags))
+        self.lbl_vals.setText('　'.join(parts) or '（尚未計算）')
+        st = self._state(self.i)
+        col = C['red'] if st == 'artifact' else C['green']
+        self.lbl_state.setText(
+            f'<span style="color:{C["dim"]}">目前判讀：</span>'
+            f'<span style="color:{col};font-weight:bold;font-size:14px;">'
+            f'{JUDGE_LABEL[st]}</span>')
+        n_art = sum(1 for k in range(n) if self._state(k) == 'artifact')
+        self.lbl_count.setText(f"保留 {n - n_art}　Artifact {n_art}　（共 {n} 段）")
+
+    def closeEvent(self, ev):
+        self.mw._review_cur = None
+        self.mw._update_review_overlay()
+        self.mw.review_dlg = None
+        super().closeEvent(ev)
+        # 從「SKNA 區間分析」進來時那個視窗先收起來，判讀完再叫回來
+        if getattr(self.mw, '_review_restore_dlg', False) and self.mw.skna_dlg is not None:
+            self.mw._review_restore_dlg = False
+            self.mw.skna_dlg._rebuild_table()
+            self.mw.skna_dlg.show()
+            self.mw.skna_dlg.raise_()
+
+
 class SknaIntervalDialog(QDialog):
     """SKNA 區間分析表格 + Excel 匯出。"""
 
-    N_COLS = 14
+    N_COLS = 17
 
     def _col_labels(self):
         """表格欄位標題。振幅類欄位的單位取決於來源通道，所以動態產生。"""
@@ -5936,7 +6350,8 @@ class SknaIntervalDialog(QDialog):
                 f'BPF aSKNA\n({u})', f'BPF iSKNA\n({u}·s)',
                 f'S3 aSKNA\n({u})', f'S3 iSKNA\n({u}·s)',
                 f'S3 RMS\n({u})', f'S3 Peak\n({u})',
-                '無效訊號 (%)', '品質']
+                f'Nerveact\naSKNA ({u})', f'Nerveact\niSKNA ({u}·s)',
+                '無效訊號 (%)', '品質', '判讀']
 
     def __init__(self, parent, main_window):
         super().__init__(parent)
@@ -6002,7 +6417,12 @@ class SknaIntervalDialog(QDialog):
         b_auto.setToolTip('設定每段長度與間隔（例如每 10 秒一段），\n'
                           '一次對整個檔案或指定範圍產生區間並計算 SKNA')
         b_auto.clicked.connect(self._add_auto)
-        for b in (b_sel, b_man, b_ts, b_view, b_auto):
+        b_rev = QPushButton('Artifact')
+        b_rev.setToolTip('依序檢視每一段 SKNA 波形，預設保留，'
+                         '標出 Artifact 區段（僅 BPF）')
+        b_rev.clicked.connect(lambda: self.mw._open_artifact_review(
+            self._first_selected_row(), from_dialog=True))
+        for b in (b_sel, b_man, b_ts, b_view, b_auto, b_rev):
             row1.addWidget(b)
         row1.addStretch()
         lay.addLayout(row1)
@@ -6128,12 +6548,12 @@ class SknaIntervalDialog(QDialog):
 
     def _add_from_timestamps(self):
         mgr = self.mw.ts_mgr
-        if mgr is None or not getattr(mgr, 'stamps', None):
+        if mgr is None or not (getattr(mgr, 'records', None) or getattr(mgr, 'stamps', None)):
             QMessageBox.information(self, '沒有時間戳記',
                                     '目前檔案還沒有任何已儲存的時間戳記。')
             return
         n = 0
-        for st in mgr.stamps:
+        for st in (getattr(mgr, 'records', None) or getattr(mgr, 'stamps', None) or []):
             a = st.get('t_start')
             b = st.get('t_end')
             if a is None or b is None or float(b) <= float(a):
@@ -6151,11 +6571,34 @@ class SknaIntervalDialog(QDialog):
             return
         self._rebuild_table()
 
+    def _time_points(self):
+        """自動分段可選的時間：SKNA 時間點位 + 時間戳記（起／迄）。"""
+        pts = []
+        for m in (self.mw.skna_marks or []):
+            try:
+                t = float(m['t'])
+            except Exception:
+                continue
+            kind = 'end' if m.get('kind') == 'end' else 'start'
+            name = str(m.get('name', ''))
+            pts.append((t, f"📍 {name} {'起點' if kind == 'start' else '終點'}　{fmt_hms(t)}",
+                        name, kind))
+        mgr = self.mw.ts_mgr
+        for st in (getattr(mgr, 'records', None) or []) if mgr else []:
+            lbl = str(st.get('label') or st.get('tag') or '時間戳記')
+            a, b = st.get('t_start'), st.get('t_end')
+            if a is not None:
+                pts.append((float(a), f"🕒 {lbl}{' 起' if b is not None else ''}　{fmt_hms(float(a))}",
+                            '🕒' + lbl, 'start' if b is not None else ''))
+            if b is not None:
+                pts.append((float(b), f"🕒 {lbl} 迄　{fmt_hms(float(b))}", '🕒' + lbl, 'end'))
+        return sorted(pts, key=lambda p: p[0])
+
     def _add_auto(self):
         d = self.mw.ecg_data
         if d is None or self.mw.skna_cfg.get('src_ch') is None:
             return
-        dlg = AutoWindowDialog(self, d)
+        dlg = AutoWindowDialog(self, d, self._time_points())
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         wins, prefix, clear = dlg.result_settings()
@@ -6243,6 +6686,7 @@ class SknaIntervalDialog(QDialog):
             res = r['res'] or {}
             a = res.get('all', {}) if res.get('ok') else {}
             s3 = res.get('s3', {}) if res.get('ok') else {}
+            na = res.get('nact', {}) if res.get('ok') else {}
             t0s = d.abs_time(r['t0']) if d else fmt_hms(r['t0'])
             t1s = d.abs_time(r['t1']) if d else fmt_hms(r['t1'])
             hr = res.get('hr', float('nan'))
@@ -6257,8 +6701,10 @@ class SknaIntervalDialog(QDialog):
                 self._fmt(a.get('aSKNA')), self._fmt(a.get('iSKNA'), 2),
                 self._fmt(s3.get('aSKNA')), self._fmt(s3.get('iSKNA'), 2),
                 self._fmt(s3.get('RMS')), self._fmt(s3.get('peak')),
+                self._fmt(na.get('aSKNA')), self._fmt(na.get('iSKNA'), 2),
                 self._fmt(res.get('bad_pct'), 1),
                 ('✓' if not flags else '⚠ ' + '、'.join(flags)),
+                JUDGE_LABEL.get(r.get('judge'), '保留'),
             ]
             for j, v in enumerate(vals):
                 it = QTableWidgetItem(str(v))
@@ -6267,7 +6713,10 @@ class SknaIntervalDialog(QDialog):
                 if j >= 3:
                     it.setTextAlignment(Qt.AlignmentFlag.AlignRight |
                                         Qt.AlignmentFlag.AlignVCenter)
-                if j == len(vals) - 1 and flags:
+                if j == len(vals) - 1:
+                    if r.get('judge') == 'artifact':
+                        it.setForeground(QColor(C['red']))
+                if j == len(vals) - 2 and flags:
                     it.setForeground(QColor(C['yellow']))
                 self.table.setItem(i, j, it)
         self.table.blockSignals(False)
@@ -6367,6 +6816,13 @@ class SknaIntervalDialog(QDialog):
         a2 = menu.addAction('複製選取的儲存格（含欄位標題）')
         a3 = menu.addAction('複製整列（含欄位標題）')
         menu.addSeparator()
+        menu.addSeparator()
+        j1 = menu.addAction('標記為 Artifact')
+        j2 = menu.addAction('標記為保留')
+        j4 = menu.addAction('從這一列開始 Artifact 判讀…')
+        for a in (j1, j2, j4):
+            a.setEnabled(has)
+        menu.addSeparator()
         a4 = menu.addAction('全選')
         for a in (a1, a2, a3):
             a.setEnabled(has)
@@ -6377,6 +6833,12 @@ class SknaIntervalDialog(QDialog):
             self._copy_cells(with_header=True)
         elif act is a3:
             self._copy_rows()
+        elif act in (j1, j2):
+            sel = sorted({i.row() for i in self.table.selectedIndexes()})
+            self.mw.skna_set_judge(sel, 'artifact' if act is j1 else 'keep')
+        elif act is j4:
+            self.mw._open_artifact_review(self._first_selected_row(),
+                                          from_dialog=True)
         elif act is a4:
             self.table.selectAll()
 
@@ -6404,9 +6866,14 @@ class SknaIntervalDialog(QDialog):
         self.rows = []
         self._rebuild_table()
 
+    def _first_selected_row(self) -> int:
+        sel = sorted({i.row() for i in self.table.selectedIndexes()})
+        return sel[0] if sel else 0
+
     def _write_xlsx(self, path: str) -> bool:
         """實際寫檔，錯誤都轉成對話框。成功回傳 True。"""
         try:
+            self.mw._apply_judge()
             export_skna_xlsx(
                 path, self.mw.ecg_data, self.mw.skna_cfg, self.rows,
                 s3_info=(self.mw.s3_cache if self.mw._s3_is_valid() else None))
@@ -6510,7 +6977,10 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         (f'S3 aSKNA ({unit})', 15), (f'S3 iSKNA ({unit}·s)', 16),
         (f'S3 RMS ({unit})', 13), (f'S3 Peak ({unit})', 14),
         (f'S3 SD ({unit})', 13),
+        (f'Nerveact 相容 aSKNA ({unit})', 18),
+        (f'Nerveact 相容 iSKNA ({unit}·s)', 19),
         ('無效訊號 (%)', 12), ('R-peak 來源', 28), ('品質警示', 24),
+        ('判讀', 10),
     ]
     hdr_fill = PatternFill('solid', fgColor='1F3864')
     hdr_font = Font(bold=True, color='FFFFFF', size=10)
@@ -6527,10 +6997,12 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
     ws.row_dimensions[1].height = 32
 
     warn_font = Font(color='9C6500')
+    art_fill = PatternFill('solid', fgColor='FCE4D6')
     for i, r in enumerate(rows, start=2):
         res = r.get('res') or {}
         a = res.get('all', {}) if res.get('ok') else {}
         s3 = res.get('s3', {}) if res.get('ok') else {}
+        na = res.get('nact', {}) if res.get('ok') else {}
         flags = res.get('flags', [])
 
         def num(v):
@@ -6551,16 +7023,22 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
             num(a.get('RMS')), num(a.get('peak')), num(a.get('SD')),
             num(s3.get('aSKNA')), num(s3.get('iSKNA')),
             num(s3.get('RMS')), num(s3.get('peak')), num(s3.get('SD')),
+            num(na.get('aSKNA')), num(na.get('iSKNA')),
             num(res.get('bad_pct')),
             r.get('src', ''),
             ('、'.join(flags) if flags else ''),
+            JUDGE_LABEL.get(r.get('judge'), '保留'),
         ]
         for j, v in enumerate(vals, start=1):
             c = ws.cell(row=i, column=j, value=v)
             if isinstance(v, float):
-                c.number_format = '0.0' if j in (8, 9, 20) else '0.0000'
-            if j == len(vals) and flags:
+                c.number_format = '0.0' if j in (8, 9, 22) else '0.0000'
+            if j == len(vals) - 1 and flags:
                 c.font = warn_font
+            if r.get('judge') == 'artifact':
+                c.fill = art_fill
+
+    _add_judge_summary(wb, ws, headers, len(rows), unit, cfg)
 
     ws2 = wb.create_sheet('Settings')
     ws2.column_dimensions['A'].width = 26
@@ -6595,6 +7073,10 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         ('包絡移動平均 (ms)', cfg['env_ms']),
         ('工頻陷波 (Hz)', cfg.get('notch', 0.0) or '關閉'),
         ('樣本排除', '無（BPF 使用區間內全部樣本，不排除 QRS）'),
+        ('Nerveact 相容模式',
+         (f"開啟：每 {cfg.get('nact_win', 10.0):g} s 切窗，各窗獨立以 Butterworth "
+          f"{cfg['order']} 階單向濾波 (sosfilt)、從零狀態開始，整流取平均")
+         if cfg.get('nact_compat') else '關閉（Nerveact 欄位為空）'),
         ('R-peak 來源設定',
          ('沿用畫面上的 R-peak 標記' if cfg.get('rpeak_source') == 'screen'
           else '自動偵測（SKNA 專用演算法 detect_rpeaks_robust）')),
@@ -6629,9 +7111,15 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         ('S3 前綴的欄位', 'S3 分解掉心電成分後的輸出直接計算的同名指標，'
                    '不再套帶通（只有 S3 前置高通與慢速漂移移除），'
                    '因此頻寬比 BPF 那組寬，數值不能直接等同'),
+        ('Nerveact 相容欄位', '重現 Nerveact 的算法：逐窗單向濾波、每窗從零狀態開始。'
+                         '每窗起點的直流電位會產生濾波暫態並計入（約每 10 mV '
+                         '+0.45 µV），單向濾波通帶也較寬（約高 6–10%）；'
+                         '僅供與 Nerveact 數值對照'),
         ('無效訊號 (%)', '該區間內沒有有效訊號的樣本比例：放大器滿格（波形被'
                         '削平）或完全沒有變化。那些區段不含訊號內容，'
                         '數值不具物理意義'),
+        ('判讀', '人工逐段判讀結果（預設保留，標記為 Artifact 者排除），僅針對傳統帶通 BPF。'
+                '可直接在 Excel 的判讀欄下拉修改，「總表」與 *排除 Artifact* 欄會自動重算'),
         ('品質警示', '訊號無效、心率超出生理範圍、RR 間期不穩、或波峰因數過大時'
                     '標示；僅為提示，不會自動剔除資料'),
         ('', ''),
@@ -6653,8 +7141,94 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         if str(k).startswith('■'):
             ck.font = bold
 
+    try:
+        wb.calculation.fullCalcOnLoad = True
+    except Exception:
+        pass
     wb.save(path)
     return path
+
+
+def _add_judge_summary(wb, ws, headers, n_rows: int, unit: str, cfg: dict):
+    """在 SKNA Intervals 加上「排除 Artifact」輔助欄與判讀下拉選單，
+    並建立「總表」分頁（全部區間 vs 排除 Artifact 的統計）。
+
+    全部用公式：在 Excel 裡改判讀欄，總表會跟著重算。
+    """
+    from openpyxl.styles import Font, Alignment, PatternFill
+    from openpyxl.utils import get_column_letter as L
+    from openpyxl.worksheet.datavalidation import DataValidation
+    names = [h for h, _ in headers]
+    col = {h: names.index(h) + 1 for h in names}
+    jcol = L(col['判讀'])
+    last = n_rows + 1
+    metrics = [(f'BPF aSKNA ({unit})', 'BPF aSKNA'),
+               (f'BPF iSKNA ({unit}·s)', 'BPF iSKNA'),
+               (f'Nerveact 相容 aSKNA ({unit})', 'Nerveact 相容 aSKNA'),
+               (f'Nerveact 相容 iSKNA ({unit}·s)', 'Nerveact 相容 iSKNA')]
+    hdr_fill = PatternFill('solid', fgColor='1F3864')
+    hdr_font = Font(bold=True, color='FFFFFF', size=10)
+    helper = {}
+    c0 = len(names) + 1
+    for k, (h, short) in enumerate(metrics):
+        cc = c0 + k
+        helper[h] = L(cc)
+        c = ws.cell(row=1, column=cc, value=f'{h}\n排除 Artifact')
+        c.fill = PatternFill('solid', fgColor='7F6000'); c.font = hdr_font
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        ws.column_dimensions[L(cc)].width = 17
+        src = L(col[h])
+        for r in range(2, last + 1):
+            x = ws.cell(row=r, column=cc,
+                        value=f'=IF(OR(${jcol}{r}="Artifact",{src}{r}=""),"",{src}{r})')
+            x.number_format = '0.0000'
+    if n_rows:
+        dv = DataValidation(type='list', formula1='"保留,Artifact"',
+                            allow_blank=True)
+        ws.add_data_validation(dv)
+        dv.add(f'{jcol}2:{jcol}{last}')
+
+    sm = wb.create_sheet('總表', 0)
+    q = "'SKNA Intervals'!"
+    sm['A1'] = 'SKNA 總表（人工 Artifact 判讀）'
+    sm['A1'].font = Font(bold=True, size=13, color='1F3864')
+    sm['A2'] = (f"帶通 {cfg['bp_lo']:.0f}–{cfg['bp_hi']:.0f} Hz（BPF）。"
+                '判讀僅適用 BPF 與 Nerveact 相容欄位；在 SKNA Intervals 的「判讀」'
+                '欄修改後，本頁自動重算。')
+    jr = f'{q}${jcol}$2:${jcol}${last}'
+    cnt = [('區間總數', f'=COUNTA({q}$A$2:$A${last})'),
+           ('保留', f'=COUNTIF({jr},"保留")'),
+           ('Artifact', f'=COUNTIF({jr},"Artifact")')]
+    for i, (k, f) in enumerate(cnt):
+        sm.cell(row=4 + i, column=1, value=k).font = Font(bold=True)
+        sm.cell(row=4 + i, column=2, value=f)
+    hr = 9
+    heads = ['指標', '全部：平均', '全部：SD', '全部：中位數', '全部：n',
+             '排除 Artifact：平均', '排除 Artifact：SD', '排除 Artifact：中位數',
+             '排除 Artifact：n', '差異 (%)']
+    for j, h in enumerate(heads, 1):
+        c = sm.cell(row=hr, column=j, value=h)
+        c.fill = hdr_fill; c.font = hdr_font
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    for i, (h, short) in enumerate(metrics):
+        r = hr + 1 + i
+        a = f'{q}${L(col[h])}$2:${L(col[h])}${last}'
+        b = f'{q}${helper[h]}$2:${helper[h]}${last}'
+        vals = [short,
+                f'=IFERROR(AVERAGE({a}),"")', f'=IFERROR(STDEV({a}),"")',
+                f'=IFERROR(MEDIAN({a}),"")', f'=COUNT({a})',
+                f'=IFERROR(AVERAGE({b}),"")', f'=IFERROR(STDEV({b}),"")',
+                f'=IFERROR(MEDIAN({b}),"")', f'=COUNT({b})',
+                f'=IFERROR((F{r}-B{r})/B{r},"")']
+        for j, v in enumerate(vals, 1):
+            c = sm.cell(row=r, column=j, value=v)
+            c.number_format = '0.0%' if j == 10 else ('0' if j in (5, 9) else '0.0000')
+    sm.cell(row=hr + 6, column=1,
+            value='註：Nerveact 相容欄位只有在 SKNA 設定開啟「Nerveact 相容模式」時才有數值。'
+                  '未標記為 Artifact 的區段一律視為保留。')
+    for j, w in enumerate([22, 12, 11, 12, 8, 15, 14, 15, 13, 10], 1):
+        sm.column_dimensions[L(j)].width = w
+    sm.row_dimensions[hr].height = 32
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -6680,6 +7254,10 @@ class MainWindow(QMainWindow):
         self.s3_thread: 'S3Worker | None' = None
         self.skna_rows: list[dict] = []  # SKNA 時間區段（側邊欄與區間視窗共用）
         self.skna_marks: list[dict] = [] # SKNA 時間點位（起點／終點）
+        self.skna_judge: dict = {}       # Artifact 判讀 {judge_key: 'artifact'|'keep'}
+        self.review_dlg = None
+        self._review_cur = None
+        self._review_restore_dlg = False
         self._mark_unpaired: list[int] = []
         self.page = 0                   # 0 = ECG 頁, 1 = SKNA 頁
 
@@ -6781,6 +7359,8 @@ class MainWindow(QMainWindow):
         self.side.mark_add_requested.connect(self._mark_begin)
         self.side.mark_delete_requested.connect(self._mark_delete)
         self.side.mark_goto_index.connect(self._mark_goto_index)
+        self.side.skna_review_requested.connect(
+            lambda: self._open_artifact_review(None))
 
         self.stack_lay.addWidget(self.main_widget)
 
@@ -7377,6 +7957,7 @@ class MainWindow(QMainWindow):
     def _marks_load(self):
         """開檔時載入先前存的時間點位。"""
         self.skna_marks = []
+        self.skna_judge = {}
         self._marks_imported = False
         pth = self._marks_path()
         if not pth or not os.path.exists(pth):
@@ -7394,6 +7975,9 @@ class MainWindow(QMainWindow):
                             'kind': 'end' if m.get('kind') == 'end' else 'start',
                             'src': str(m.get('src', '') or '')})
             self.skna_marks = out
+            if isinstance(data, dict) and isinstance(data.get('judgements'), dict):
+                self.skna_judge = {str(k): v for k, v in data['judgements'].items()
+                                   if v in ('artifact', 'keep')}
         except Exception:
             self.skna_marks = []
 
@@ -7438,6 +8022,7 @@ class MainWindow(QMainWindow):
                 'saved_at': datetime.datetime.now().isoformat(timespec='seconds'),
                 'imported_from_file': bool(getattr(self, '_marks_imported', False)),
                 'marks': self.skna_marks,
+                'judgements': self.skna_judge,
             }
             with open(pth, 'w', encoding='utf-8') as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -7543,7 +8128,9 @@ class MainWindow(QMainWindow):
         self.side.refresh_marks(self.skna_marks, self._mark_unpaired,
                                 self.ecg_data,
                                 mark_mode=self.waveform.mark_mode)
+        self._apply_judge()
         self.side.refresh_skna_list(self.skna_rows, self.ecg_data)
+        self._update_review_overlay()
 
     def _skna_compute_row(self, i: int):
         """計算單一 SKNA 區間的指標（側邊欄新增時用，與區間視窗共用邏輯）。"""
@@ -7589,6 +8176,73 @@ class MainWindow(QMainWindow):
         self._sync_skna_side()
         if self.skna_dlg is not None:
             self.skna_dlg._rebuild_table()
+
+    # ── Artifact 判讀 ───────────────────────────────────────────────────
+
+    def _apply_judge(self):
+        """把判讀結果（以起訖時間為鍵）套到目前的區間清單上。"""
+        for r in self.skna_rows:
+            r['judge'] = self.skna_judge.get(judge_key(r['t0'], r['t1']))
+
+    def skna_set_judge(self, indices: list, state):
+        """state：'artifact'、'keep'，或 None（清除）。"""
+        for i in indices:
+            if 0 <= i < len(self.skna_rows):
+                r = self.skna_rows[i]
+                k = judge_key(r['t0'], r['t1'])
+                if state != 'artifact':           # 預設就是保留，不必存
+                    self.skna_judge.pop(k, None)
+                else:
+                    self.skna_judge[k] = state
+        self._marks_save()
+        self._sync_skna_side()
+        if self.skna_dlg is not None:
+            self.skna_dlg._rebuild_table()
+
+    def _update_review_overlay(self):
+        if not hasattr(self, 'waveform'):
+            return
+        if self.ecg_data is None or getattr(self, 'page', 0) != 1:
+            self.waveform.set_review([], None)
+            return
+        regions = [(r['t0'], r['t1'],
+                    self.skna_judge.get(judge_key(r['t0'], r['t1'])))
+                   for r in self.skna_rows]
+        self.waveform.set_review(regions, self._review_cur)
+
+    def _open_artifact_review(self, start=None, from_dialog: bool = False):
+        if not self._require_file():
+            return
+        if self.skna_cfg.get('method') == 's3':
+            QMessageBox.information(
+                self, 'Artifact 判讀',
+                'Artifact 逐段判讀只用於傳統帶通（BPF）。\n'
+                '目前 SKNA 設定選的是 S3，請先在「SKNA 設定」改回傳統帶通。')
+            return
+        if not self.skna_rows:
+            QMessageBox.information(
+                self, 'Artifact 判讀',
+                '目前沒有任何 SKNA 區間。\n請先在「區間分析」用「自動分段計算」'
+                '產生區段（例如每 10 秒一段），再逐段判讀。')
+            return
+        if from_dialog and self.skna_dlg is not None and self.skna_dlg.isVisible():
+            self.skna_dlg.hide()
+            self._review_restore_dlg = True
+        if self.page != 1:
+            self.set_page(1)
+        if start is None:
+            start = max(0, self.side.skna_list.currentRow())
+        if self.review_dlg is None:
+            self.review_dlg = ArtifactReviewDialog(self, start)
+            g = self.geometry()
+            self.review_dlg.adjustSize()
+            self.review_dlg.move(g.right() - self.review_dlg.width() - 40,
+                                 g.bottom() - self.review_dlg.height() - 80)
+        else:
+            self.review_dlg.goto(start)
+        self.review_dlg.show()
+        self.review_dlg.raise_()
+        self.review_dlg.activateWindow()
 
     def _skna_goto_index(self, i: int):
         if 0 <= i < len(self.skna_rows):
