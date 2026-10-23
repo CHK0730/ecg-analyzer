@@ -4590,12 +4590,20 @@ class WaveformWidget(QWidget):
         self._draw()
 
     def wheelEvent(self, event):
-        """攔截滾輪事件，用我們自己的 zoom 方法處理"""
+        """攔截滾輪事件，用我們自己的 zoom 方法處理。
+
+        縮放量跟著滾動量走：一般滑鼠滾一格（angleDelta = 120）放大 1.25 倍；
+        Mac 觸控板／Magic Mouse 一次滑動會送出幾十個小事件（每個只有幾度），
+        若每個事件都固定縮放 1.5 倍，輕輕一滑就縮放好幾十倍。
+        """
         delta = event.angleDelta().y()
-        if delta > 0:
-            self.zoom(1.5)
-        elif delta < 0:
-            self.zoom(1 / 1.5)
+        if delta == 0:
+            event.accept()
+            return
+        factor = 1.25 ** (delta / 120.0)
+        factor = max(1 / 1.25, min(1.25, factor))   # 單一事件最多 1.25 倍
+        if abs(factor - 1.0) > 1e-4:
+            self.zoom(factor)
         event.accept()
 
     def toggle_mark_mode(self, on: bool):
