@@ -1371,8 +1371,8 @@ SKNA_DEFAULTS = {
     'notch':         0.0,      # 額外工頻陷波（0 = 關閉）
     'rpeak_source':  'auto',   # 'auto' = SKNA 專用偵測；'screen' = 沿用畫面標記
     'method':        'bpf',    # 'bpf' = 傳統帶通；'s3' = 先用 S3 移除心電成分
-    'disp1':         's3',     # S3 模式下軌道 2 顯示：'s3' 或 'bpf'（只影響畫面）
-    'disp2':         's3',     # S3 模式下軌道 3 顯示：'s3' 或 'bpf'
+    'disp1':         'bpf',    # 軌道 2 顯示：'bpf'（Bandpass）或 's3'
+    'disp2':         'bpf',    # 軌道 3 顯示：'bpf'（Bandpass）或 's3'
     's3_hp_hz':      1.0,      # S3 前置高通截止 (Hz)
     's3_K':          30,       # S3 非局部中位數鄰居數
     's3_detrend':    True,     # S3 後移除慢速漂移
@@ -2677,7 +2677,7 @@ class SidePanel(QWidget):
                      + (lambda t_: f'（{t_} 顯示 S3）' if t_ else '')(
                          '、'.join(n_ for n_, k_, b_ in (('軌2', 'disp1', 1),
                                                          ('軌3', 'disp2', 2))
-                                   if is_s3 and cfg.get(k_, 's3') == 's3'
+                                   if is_s3 and cfg.get(k_, 'bpf') == 's3'
                                    and (b_ == 1 or not skna_tracks_differ(cfg)))))
         self._set_kv(self.lbl_skna_env, '包絡窗長', f"{cfg['env_ms']:.0f} ms")
         if not is_s3:
@@ -3388,15 +3388,15 @@ class WaveformWidget(QWidget):
     def _mode_combo(self, track: int) -> QComboBox:
         """S3 模式下，軌道標題列上的「帶通／S3」顯示選單。"""
         cb = QComboBox()
-        cb.addItems(['帶通 BPF', 'S3'])
+        cb.addItems(['Bandpass', 'S3'])
         cb.setMaximumHeight(22)
         cb.setStyleSheet(
             f'QComboBox{{background:{C["panel"]};color:{C["orange"]};'
             f'border:1px solid {C["border"]};border-radius:4px;'
             f'padding:1px 6px;font-size:11px;}}'
             f'QComboBox::drop-down{{border:none;}}')
-        cb.setToolTip(f'軌道 {track + 1} 顯示帶通結果或 S3 分解結果'
-                      '（只影響畫面；區間分析與 Excel 兩種都會輸出）')
+        cb.setToolTip(f'軌道 {track + 1} 顯示 Bandpass（帶通）或 S3 分解結果。'
+                      '選 S3 時若還沒做過 S3 分解，會自動對整個檔案分解。')
         cb.currentIndexChanged.connect(lambda i, t=track: self._on_mode_edit(t, i))
         cb.setVisible(False)
         return cb
@@ -3410,13 +3410,14 @@ class WaveformWidget(QWidget):
     def _track_shows_s3(self, band: int) -> bool:
         cfg = self.skna_cfg
         return (cfg.get('method') == 's3'
-                and cfg.get('disp1' if band == 1 else 'disp2', 's3') == 's3'
+                and cfg.get('disp1' if band == 1 else 'disp2', 'bpf') == 's3'
                 and self._s3_ok_for(band))
 
     def _on_mode_edit(self, track: int, idx: int):
         key = 'disp1' if track == 1 else 'disp2'
         val = 's3' if idx == 1 else 'bpf'
-        if self.skna_cfg.get(key, 's3') != val:
+        shown = 's3' if self._track_shows_s3(track) else 'bpf'
+        if shown != val:
             self.skna_track_edit.emit({key: val})
 
     def _band_widget(self, track: int):
@@ -3757,7 +3758,7 @@ class WaveformWidget(QWidget):
             cb.model().item(1).setEnabled(ok)
             cb.setCurrentIndex(1 if self._track_shows_s3(band) else 0)
             cb.blockSignals(False)
-            cb.setVisible(on_skna and s3)
+            cb.setVisible(on_skna)
             if band == 2 and not ok:
                 cb.setToolTip('S3 是對軌道 2 的來源通道分解的；軌道 3 要選同一個'
                               '通道才能顯示 S3')
@@ -5772,7 +5773,7 @@ class SknaSettingsDialog(QDialog):
             'SKNA 頁有兩個 SKNA 軌道，各有自己的帶通：軌道 2（預設 500–1000 Hz）'
             '與軌道 3（預設 500–1500 Hz）。區間分析、Artifact 判讀與匯出的 Excel '
             '會同時計算兩組。套用 S3 時兩個軌道都會自動顯示 S3，之後可在軌道標題列的'
-            '「帶通 BPF／S3」選單各自切換（軌道 3 需與軌道 2 同一通道才能顯示 S3）。\n\n'
+            '「Bandpass／S3」選單各自切換（軌道 3 需與軌道 2 同一通道才能顯示 S3）。\n\n'
             '預設值：\n'
             '  500–1000 Hz — Kusayama 2020 Nature Protocols 的標準設定，'
             '要對照文獻數值請用這一組。\n'
@@ -8366,13 +8367,7 @@ class MainWindow(QMainWindow):
         new = dict(self.skna_cfg)
         new.update(upd)
         if set(upd) <= {'disp1', 'disp2'}:
-            # 只是切換畫面顯示帶通或 S3，不影響任何數值，不必重算
-            self.skna_cfg = new
-            self.waveform.skna_cfg = dict(new)
-            self.waveform._draw()
-            which = '軌道 2' if 'disp1' in upd else '軌道 3'
-            self.lbl_status.setText(
-                f"{which} 改為顯示 {'S3' if list(upd.values())[0] == 's3' else '帶通 BPF'}")
+            self._on_track_display(upd, new)
             return
         n = len(self.skna_rows)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -8387,13 +8382,57 @@ class MainWindow(QMainWindow):
                else f"{skna_band_label(self.skna_cfg, 2)} Hz")
             + (f'，已重算 {n} 個區間' if n else ''))
 
+    def _on_track_display(self, upd: dict, new: dict):
+        """軌道標題列的「Bandpass／S3」選單。
+
+        演算法跟著軌道走：只要有一軌顯示 S3 就是 S3 模式（區間分析才會有
+        S3 欄位），兩軌都回到 Bandpass 就回到帶通模式。選 S3 而這個檔案
+        還沒分解過時，直接對整個檔案執行 S3 分解。
+        """
+        key, val = next(iter(upd.items()))
+        which = '軌道 2' if key == 'disp1' else '軌道 3'
+        was_s3 = self.skna_cfg.get('method') == 's3'
+        if val == 's3' and not was_s3:
+            # 原本是帶通模式：另一軌維持顯示 Bandpass，不要一起被切成 S3
+            other = 'disp2' if key == 'disp1' else 'disp1'
+            new[other] = 'bpf'
+        same_ch = not skna_tracks_differ(new) or \
+            skna_band_cfg(new, 2).get('src_ch') == new.get('src_ch')
+        any_s3 = (new.get('disp1', 'bpf') == 's3'
+                  or (new.get('disp2', 'bpf') == 's3' and same_ch))
+        new['method'] = 's3' if any_s3 else 'bpf'
+
+        if new['method'] != self.skna_cfg.get('method'):
+            # 演算法改變：區間要重算（S3 欄位出現或消失）
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self._apply_skna_cfg(new, interactive=False)
+            finally:
+                QApplication.restoreOverrideCursor()
+        else:
+            # 只是換另一軌的顯示，數值不變，不必重算
+            self.skna_cfg = new
+            self.waveform.skna_cfg = dict(new)
+            self.waveform._draw()
+            self._sync_skna_side()
+        self.lbl_status.setText(
+            f"{which} 改為顯示 {'S3' if val == 's3' else 'Bandpass'}")
+
+        if val == 's3' and not self._s3_is_valid():
+            running = self.s3_thread is not None and self.s3_thread.isRunning()
+            if not running:
+                self.lbl_status.setText(f'{which} 選擇 S3：這個檔案還沒分解過，'
+                                        '自動執行 S3 分解（整檔）…')
+                QTimer.singleShot(0, lambda: self._run_s3(True))
+
     def _apply_skna_cfg(self, new_cfg: dict, interactive: bool = True):
         old_key = s3_param_key(self.skna_cfg)
         self.skna_cfg = dict(new_cfg)
-        if interactive and self.skna_cfg.get('method') == 's3':
-            # 從 SKNA 設定套用 S3 時，兩個軌道都自動切成顯示 S3
-            self.skna_cfg['disp1'] = 's3'
-            self.skna_cfg['disp2'] = 's3'
+        if interactive:
+            # 從 SKNA 設定套用演算法時，兩個軌道的顯示一起跟著切換
+            d_ = 's3' if self.skna_cfg.get('method') == 's3' else 'bpf'
+            self.skna_cfg['disp1'] = d_
+            self.skna_cfg['disp2'] = d_
         self.waveform.skna_cfg = dict(self.skna_cfg)
         if self.s3_cache is not None and s3_param_key(self.skna_cfg) != old_key:
             self._invalidate_s3('通道或 S3 參數已變更')
