@@ -1531,6 +1531,21 @@ def skna_effective_band(fs: float, bp_lo: float, bp_hi: float):
     return lo, hi, warn
 
 
+_SOS_CACHE: dict = {}
+
+
+def _butter_band_sos(order: int, wlo: float, whi: float):
+    """帶通 SOS 係數快取：平移時每次重畫都要濾波，係數不必每次重新設計。"""
+    k = (order, round(wlo, 9), round(whi, 9))
+    sos = _SOS_CACHE.get(k)
+    if sos is None:
+        if len(_SOS_CACHE) > 64:
+            _SOS_CACHE.clear()
+        sos = butter(order, [wlo, whi], btype='band', output='sos')
+        _SOS_CACHE[k] = sos
+    return sos
+
+
 def skna_band_cfg(cfg: dict, band: int = 1) -> dict:
     """band=1 → 軌道 2 的帶通（bp_lo/bp_hi）；band=2 → 軌道 3（bp_lo2/bp_hi2）。
 
@@ -1602,7 +1617,7 @@ def _compute_skna_bpf(y, fs, bp_lo, bp_hi, order, env_ms, notch):
 
     lo, hi, _ = skna_effective_band(fs, bp_lo, bp_hi)
     nyq = fs / 2.0
-    sos = butter(int(order), [lo / nyq, hi / nyq], btype='band', output='sos')
+    sos = _butter_band_sos(int(order), lo / nyq, hi / nyq)
 
     # sosfiltfilt 需要足夠長度做邊緣延拓，太短就退回單向濾波
     padlen = 3 * (2 * len(sos) + 1)
@@ -3412,7 +3427,10 @@ class WaveformWidget(QWidget):
         h.setSpacing(3)
         style = (f'QDoubleSpinBox{{background:{C["panel"]};color:{C["accent"]};'
                  f'border:1px solid {C["border"]};border-radius:4px;'
-                 f'padding:0px 2px;font-size:11px;}}')
+                 f'padding:0px 2px;font-size:11px;}}'
+                 # 顯示 S3 時帶通欄位與此軌無關、不可修改：整組變灰
+                 f'QDoubleSpinBox:disabled{{color:{C["dim"]};background:{C["bg"]};'
+                 f'border:1px solid {C["border"]};}}')
         spins = []
         for tip in ('低截止 (Hz)', '高截止 (Hz)'):
             s = QDoubleSpinBox()
@@ -3426,7 +3444,8 @@ class WaveformWidget(QWidget):
             spins.append(s)
         dash = QLabel('–'); hz = QLabel('Hz')
         for l_ in (dash, hz):
-            l_.setStyleSheet(f'color:{C["dim"]}; font-size:11px;')
+            l_.setStyleSheet(f'QLabel{{color:{C["dim"]}; font-size:11px;}}'
+                             f'QLabel:disabled{{color:{C["border"]};}}')
         h.addWidget(spins[0]); h.addWidget(dash); h.addWidget(spins[1]); h.addWidget(hz)
         w.setVisible(False)
         return w, spins[0], spins[1]
@@ -3478,7 +3497,10 @@ class WaveformWidget(QWidget):
         self.lbl_ch1.setStyleSheet(f'color:{C["dim"]}; font-size:11px;')
         hdr1.addWidget(self.lbl_ch1)
         self.combo_ch1 = QComboBox()
-        self.combo_ch1.setMinimumWidth(130)
+        self.combo_ch1.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_ch1.setMinimumContentsLength(10)
+        self.combo_ch1.setMinimumWidth(90)
         self.combo_ch1.setMaximumHeight(22)
         self.combo_ch1.setStyleSheet(self.combo_ch0.styleSheet())
         self.combo_ch1.currentIndexChanged.connect(self._on_combo_ch1)
@@ -3487,6 +3509,14 @@ class WaveformWidget(QWidget):
         hdr1.addWidget(self.mode_cb2)
         self.band_w2, self.spin_t2_lo, self.spin_t2_hi = self._band_widget(1)
         hdr1.addWidget(self.band_w2)
+        self.lbl_a2 = QLabel('')
+        self.lbl_a2.setStyleSheet(f'color:{C["orange"]}; font-size:11px;')
+        self.lbl_a2.setToolTip('目前畫面範圍內的 aSKNA')
+        self.lbl_a2.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                   QSizePolicy.Policy.Preferred)
+        self.lbl_a2.setMinimumWidth(0)
+        self.lbl_a2.setVisible(False)
+        hdr1.addWidget(self.lbl_a2)
         for b in self._y_buttons(1):
             hdr1.addWidget(b)
         hdr1.addStretch()
@@ -3514,7 +3544,10 @@ class WaveformWidget(QWidget):
         self.lbl_ch3.setStyleSheet(f'color:{C["orange"]}; font-size:11px;')
         hdr3.addWidget(self.lbl_ch3)
         self.combo_ch3 = QComboBox()
-        self.combo_ch3.setMinimumWidth(130)
+        self.combo_ch3.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.combo_ch3.setMinimumContentsLength(10)
+        self.combo_ch3.setMinimumWidth(90)
         self.combo_ch3.setMaximumHeight(22)
         self.combo_ch3.setStyleSheet(self.combo_ch0.styleSheet())
         self.combo_ch3.setToolTip('軌道 3 的 SKNA 來源通道')
@@ -3525,6 +3558,13 @@ class WaveformWidget(QWidget):
         self.band_w3, self.spin_t3_lo, self.spin_t3_hi = self._band_widget(2)
         self.band_w3.setVisible(True)
         hdr3.addWidget(self.band_w3)
+        self.lbl_a3 = QLabel('')
+        self.lbl_a3.setStyleSheet(f'color:{C["orange"]}; font-size:11px;')
+        self.lbl_a3.setToolTip('目前畫面範圍內的 aSKNA')
+        self.lbl_a3.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                   QSizePolicy.Policy.Preferred)
+        self.lbl_a3.setMinimumWidth(0)
+        hdr3.addWidget(self.lbl_a3)
         for b in self._y_buttons(2):
             hdr3.addWidget(b)
         hdr3.addStretch()
@@ -3723,7 +3763,7 @@ class WaveformWidget(QWidget):
                               '通道才能顯示 S3')
             shows = self._track_shows_s3(band)
             # 顯示 S3 時帶通欄位沒有作用（S3 輸出不再帶通），只用於 BPF 欄位
-            for s_ in w_.findChildren(QDoubleSpinBox):
+            for s_ in w_.findChildren(QDoubleSpinBox) + w_.findChildren(QLabel):
                 s_.setEnabled(not shows)
             w_.setToolTip('顯示 S3 時帶通設定不影響畫面，只用於區間分析的 BPF 欄位'
                           if shows else '')
@@ -3903,7 +3943,7 @@ class WaveformWidget(QWidget):
             vb2.blockSignals(False)
             self._curve_wave2.setData(t2, y2)
             if env2 is not None:
-                self._curve_skna_env.setData(t2, env2)
+                self._curve_skna_env.setData(*env2)
             else:
                 self._curve_skna_env.setData([], [])
             if self._y_auto1:
@@ -3933,7 +3973,7 @@ class WaveformWidget(QWidget):
             vb3.setRange(xRange=actual_vr[0], padding=0)
             vb3.blockSignals(False)
             self._curve_wave3.setData(t3, y3)
-            self._curve_skna_env3.setData(t3, env3)
+            self._curve_skna_env3.setData(*env3)
             if self._y_auto2:
                 self._auto_y_range(self.plot_wave3, y3)
             self.plot_wave3.setVisible(True)
@@ -3981,6 +4021,7 @@ class WaveformWidget(QWidget):
             self.combo_ch1.setEnabled(True)
             self.combo_ch1.setToolTip('軌道 2 的 SKNA 來源通道')
             self.band_w2.setVisible(True)
+            self.lbl_a2.setVisible(True)
             self._sync_skna_headers()
         else:
             self.lbl_ch1.setText('軌道 2：')
@@ -3996,6 +4037,7 @@ class WaveformWidget(QWidget):
             self.combo_ch1.setToolTip('選擇軌道 2 顯示的通道')
             self.band_w2.setVisible(False)
             self.mode_cb2.setVisible(False)
+            self.lbl_a2.setVisible(False)
 
     def _track_plots(self):
         """目前看得到的波形軌道（畫點位、時間戳記、測量線、判讀框用）。"""
@@ -4029,11 +4071,10 @@ class WaveformWidget(QWidget):
             self._sync_skna_headers()
 
         use_s3 = self._track_shows_s3(band) and self.s3_sna is not None
-        t, rsna, env = skna_segment(self.data, ch, t0, t1, cfg,
-                                    sig=(self.s3_sna if use_s3 else None))
+        t, rsna, env = self._skna_cached(band, ch, t0, t1, cfg, use_s3)
         if len(t) == 0:
             self._set_ylabel(plot, 'SKNA（此範圍無資料）')
-            return t, rsna, env
+            return t, rsna, (t, env)
 
         rsna = rsna * scale
         env  = env * scale
@@ -4044,21 +4085,61 @@ class WaveformWidget(QWidget):
 
         tag = 'S3' if use_s3 else 'BPF'
         band_txt = 'S3 輸出（未帶通）' if use_s3 else f'{lo:.0f}–{hi:.0f} Hz'
+        # 視窗 aSKNA 每次平移都會變，放在標題列的 QLabel；縱軸標題只在
+        # 通道／帶通改變時才需要重設（setLabel 會讓整條座標軸重繪，很貴）
+        (self.lbl_a3 if band == 2 else self.lbl_a2).setText(
+            f'視窗 aSKNA {a_win:.3f} {unit}')
         label = (f'SKNA [{tag}]　CH{ch}: {self.data.ch_names[ch]}　'
-                 f'{band_txt}　({unit})　'
-                 f'視窗 aSKNA = {a_win:.3f} {unit}')
+                 f'{band_txt}　({unit})')
         if self._track_shows_s3(band) and self.s3_sna is None:
             label += '　⚠ 尚未執行 S3 分解，顯示的是原始帶通結果'
         if warn and not use_s3:
             label += '　⚠ 已受 Nyquist 限制'
         self._set_ylabel(plot, label)
 
+        # 包絡是平滑的低頻訊號（100 ms 移動平均），每個像素兩點就夠；
+        # 粗線畫上萬個點在 Qt 裡很慢，是 SKNA 頁平移卡頓的主因之一
+        n_env = int(min(len(t), max(400, max_pts // 5)))
+        if n_env < len(t):
+            idx = np.linspace(0, len(t) - 1, n_env).astype(np.int64)
+            env_xy = (t[idx], env[idx])
+        else:
+            env_xy = (t, env)
         if len(t) > max_pts:
             t_d, r_d = peak_decimate(t, rsna, max_pts)
-            # 包絡是平滑的低頻訊號，直接內插到抽稀後的時間點即可
-            e_d = np.interp(t_d, t, env)
-            return t_d, r_d, e_d
-        return t, rsna, env
+            return t_d, r_d, env_xy
+        return t, rsna, env_xy
+
+    # 平移時每一步只移動視窗的 15%：一次把畫面前後各多一個視窗寬度的
+    # SKNA 濾好存起來，之後幾步直接切片，不必每一步都重新濾波
+    _SKNA_CACHE_MAX_SEC = 60.0
+
+    def _skna_cached(self, band, ch, t0, t1, cfg, use_s3):
+        key = (id(self.data), ch, float(cfg.get('bp_lo', 0)), float(cfg.get('bp_hi', 0)),
+               int(cfg.get('order', 4)), float(cfg.get('env_ms', 100.0)),
+               float(cfg.get('notch', 0.0)), bool(use_s3),
+               id(self.s3_sna) if use_s3 else 0)
+        win = t1 - t0
+        if win > self._SKNA_CACHE_MAX_SEC:
+            # 畫面很寬時快取三倍範圍太占記憶體，直接算畫面範圍
+            return skna_segment(self.data, ch, t0, t1, cfg,
+                                sig=(self.s3_sna if use_s3 else None))
+        cache = getattr(self, '_skna_cache', None)
+        if cache is None:
+            cache = self._skna_cache = {}
+        c = cache.get(band)
+        if c is None or c['key'] != key or t0 < c['a'] - 1e-9 or t1 > c['b'] + 1e-9:
+            dur = self.data.duration
+            a, b = max(0.0, t0 - win), min(dur, t1 + win)
+            tt, rr, ee = skna_segment(self.data, ch, a, b, cfg,
+                                      sig=(self.s3_sna if use_s3 else None))
+            c = {'key': key, 'a': a if len(tt) else t0, 'b': b if len(tt) else t1,
+                 't': tt, 'r': rr, 'e': ee}
+            cache[band] = c
+        tt = c['t']
+        i0 = int(np.searchsorted(tt, t0, side='left'))
+        i1 = int(np.searchsorted(tt, t1, side='right'))
+        return tt[i0:i1], c['r'][i0:i1], c['e'][i0:i1]
 
     def set_skna(self, enabled: bool, cfg: dict | None = None):
         if cfg is not None:
