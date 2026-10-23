@@ -73,7 +73,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QSlider, QSpinBox, QDoubleSpinBox,
     QRadioButton, QButtonGroup, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QGridLayout, QProgressDialog,
-    QMenu, QStyle, QStyleOptionGroupBox,
+    QMenu, QStyle, QStyleOptionGroupBox, QAbstractSpinBox,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QSize, QRect, QRectF, QPoint, QPointF,
@@ -1359,7 +1359,8 @@ SKNA_PRESETS = {
 }
 
 SKNA_DEFAULTS = {
-    'src_ch':        None,     # SKNA 來源通道；None = 尚未設定
+    'src_ch':        None,     # SKNA 來源通道（軌道 2）；None = 尚未設定
+    'src_ch2':       None,     # 軌道 3 的來源通道；None = 與軌道 2 相同
     'ecg_ch':        None,     # R-peak 參考通道
     'bp_lo':         500.0,    # 軌道 2 帶通
     'bp_hi':         1000.0,
@@ -1538,12 +1539,24 @@ def skna_band_cfg(cfg: dict, band: int = 1) -> dict:
     c = dict(cfg)
     c['bp_lo'] = float(cfg.get('bp_lo2', 500.0))
     c['bp_hi'] = float(cfg.get('bp_hi2', 1500.0))
+    if cfg.get('src_ch2') is not None:
+        c['src_ch'] = cfg['src_ch2']
     return c
 
 
+def skna_tracks_differ(cfg: dict) -> bool:
+    """軌道 2 與軌道 3 是否用不同的來源通道。"""
+    s1, s2 = cfg.get('src_ch'), cfg.get('src_ch2')
+    return s1 is not None and s2 is not None and s1 != s2
+
+
 def skna_band_label(cfg: dict, band: int = 1) -> str:
+    """欄位名稱用的軌道標示：帶通範圍；兩軌來源通道不同時前面加上通道。"""
     c = skna_band_cfg(cfg, band)
-    return f"{float(c.get('bp_lo', 500.0)):.0f}–{float(c.get('bp_hi', 1000.0)):.0f}"
+    b = f"{float(c.get('bp_lo', 500.0)):.0f}–{float(c.get('bp_hi', 1000.0)):.0f}"
+    if skna_tracks_differ(cfg):
+        b = f"CH{c['src_ch']} {b}"
+    return b
 
 
 def compute_skna(y: np.ndarray, fs: float, bp_lo: float = 500.0,
@@ -1899,8 +1912,17 @@ def analyze_skna_interval(data, cfg: dict, t0: float, t1: float,
 
     # 軌道 3 的帶通（第二組 BPF）
     cfg2 = skna_band_cfg(cfg, 2)
-    _t2, rsna2, _e2 = skna_segment(data, ch, t0, t1, cfg2)
-    m_all2 = skna_metrics(rsna2, fs, scale) if len(rsna2) else {}
+    ch2 = cfg2['src_ch']
+    fs2 = data.fs_of(ch2)
+    scale2, _u2 = unit_to_uv(data.ch_units[ch2])
+    _t2, rsna2, _e2 = skna_segment(data, ch2, t0, t1, cfg2)
+    m_all2 = skna_metrics(rsna2, fs2, scale2) if len(rsna2) else {}
+    bad_pct2 = bad_pct
+    if ch2 != ch:
+        _tr2, raw2 = data.segment(ch2, t0, t1)
+        if len(raw2):
+            _s2, _f2, bad_pct2 = defect_pct(
+                raw2, fs2, rep_.get(ch2, {}).get('rails'))
 
     m_s3 = {}
     if s3_sig is not None:
@@ -1916,9 +1938,9 @@ def analyze_skna_interval(data, cfg: dict, t0: float, t1: float,
             m_nact['n_win'] = n_win
     m_nact2 = {}
     if cfg.get('nact_compat'):
-        rsna_n2, n_win2 = skna_nerveact_compat(data, ch, t0, t1, cfg2)
+        rsna_n2, n_win2 = skna_nerveact_compat(data, ch2, t0, t1, cfg2)
         if len(rsna_n2):
-            m_nact2 = skna_metrics(rsna_n2, fs, scale)
+            m_nact2 = skna_metrics(rsna_n2, fs2, scale2)
             m_nact2['n_win'] = n_win2
 
     hr = np.nan
@@ -1952,6 +1974,8 @@ def analyze_skna_interval(data, cfg: dict, t0: float, t1: float,
             flags.append(f'心率異常({hr:.0f})')
         if np.isfinite(rr_cv) and rr_cv > 25:
             flags.append(f'RR 不穩(CV {rr_cv:.0f}%)')
+    if ch2 != ch and bad_pct2 >= 1.0:
+        flags.append(f'軌道 3 訊號無效 {bad_pct2:.0f}%')
     if m_all.get('valid') and m_all.get('peak', 0) > 0:
         crest = m_all['peak'] / max(m_all['aSKNA'], 1e-12)
         if crest > 60:
@@ -1967,7 +1991,7 @@ def analyze_skna_interval(data, cfg: dict, t0: float, t1: float,
         'ok': True, 't0': t0, 't1': t1, 'dur': t1 - t0,
         'unit': unit_lbl, 'fs': fs,
         'all': m_all, 's3': m_s3, 'nact': m_nact,
-        'all2': m_all2, 'nact2': m_nact2,
+        'all2': m_all2, 'nact2': m_nact2, 'bad_pct2': bad_pct2,
         'band1': skna_band_label(cfg, 1), 'band2': skna_band_label(cfg, 2),
         'hr': hr, 'rr_cv': rr_cv, 'n_beat': n_beat,
         'sat_pct': sat_pct, 'flat_pct': flat_pct, 'bad_pct': bad_pct,
@@ -2621,8 +2645,13 @@ class SidePanel(QWidget):
 
         self._set_kv(self.lbl_skna_method, '演算法',
                      'S3（不再帶通）' if is_s3 else '傳統帶通 (BPF)')
-        self._set_kv(self.lbl_skna_src, '來源通道',
-                     f'CH{src} {data.ch_names[src]}')
+        if skna_tracks_differ(cfg):
+            s2_ = cfg['src_ch2']
+            self._set_kv(self.lbl_skna_src, '來源通道',
+                         f'軌2 CH{src} {data.ch_names[src]}／軌3 CH{s2_} {data.ch_names[s2_]}')
+        else:
+            self._set_kv(self.lbl_skna_src, '來源通道',
+                         f'CH{src} {data.ch_names[src]}')
         self._set_kv(self.lbl_skna_ecg, 'ECG 參考',
                      f'CH{ecg_ch} {data.ch_names[ecg_ch]}')
         self._set_kv(self.lbl_skna_band, '帶通',
@@ -3261,6 +3290,7 @@ class WaveformWidget(QWidget):
     view_changed    = pyqtSignal(float, float)
     peaks_edited    = pyqtSignal(object, dict)   # 手動新增/刪除 R-peak 後：peaks, stats
     mark_clicked    = pyqtSignal(float)          # 點位模式下點到的時間
+    skna_track_edit = pyqtSignal(dict)           # 在軌道標題列改了 SKNA 來源／帶通
 
     def __init__(self):
         super().__init__()
@@ -3334,6 +3364,33 @@ class WaveformWidget(QWidget):
             out.append(b)
         return out
 
+    def _band_widget(self, track: int):
+        """SKNA 軌道標題列上的帶通欄位：[低截止]–[高截止] Hz。"""
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(4, 0, 4, 0)
+        h.setSpacing(3)
+        style = (f'QDoubleSpinBox{{background:{C["panel"]};color:{C["accent"]};'
+                 f'border:1px solid {C["border"]};border-radius:4px;'
+                 f'padding:0px 2px;font-size:11px;}}')
+        spins = []
+        for tip in ('低截止 (Hz)', '高截止 (Hz)'):
+            s = QDoubleSpinBox()
+            s.setRange(1, 20000); s.setDecimals(0); s.setSingleStep(50)
+            s.setKeyboardTracking(False)       # 打完數字（Enter／離開）才套用
+            s.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+            s.setFixedWidth(52); s.setMaximumHeight(22)
+            s.setStyleSheet(style)
+            s.setToolTip(f'軌道 {track + 1} 帶通{tip}；輸入後按 Enter 套用')
+            s.valueChanged.connect(lambda _v, t=track: self._on_band_edit(t))
+            spins.append(s)
+        dash = QLabel('–'); hz = QLabel('Hz')
+        for l_ in (dash, hz):
+            l_.setStyleSheet(f'color:{C["dim"]}; font-size:11px;')
+        h.addWidget(spins[0]); h.addWidget(dash); h.addWidget(spins[1]); h.addWidget(hz)
+        w.setVisible(False)
+        return w, spins[0], spins[1]
+
     def _build(self):
         lay = QVBoxLayout(self)
         # 左、上、右、下留白：避免軌道標題與縱軸標籤貼齊視窗邊緣
@@ -3386,6 +3443,8 @@ class WaveformWidget(QWidget):
         self.combo_ch1.setStyleSheet(self.combo_ch0.styleSheet())
         self.combo_ch1.currentIndexChanged.connect(self._on_combo_ch1)
         hdr1.addWidget(self.combo_ch1)
+        self.band_w2, self.spin_t2_lo, self.spin_t2_hi = self._band_widget(1)
+        hdr1.addWidget(self.band_w2)
         for b in self._y_buttons(1):
             hdr1.addWidget(b)
         hdr1.addStretch()
@@ -3412,9 +3471,16 @@ class WaveformWidget(QWidget):
         self.lbl_ch3 = QLabel('軌道 3（SKNA）：')
         self.lbl_ch3.setStyleSheet(f'color:{C["orange"]}; font-size:11px;')
         hdr3.addWidget(self.lbl_ch3)
-        self.lbl_band3 = QLabel('')
-        self.lbl_band3.setStyleSheet(f'color:{C["accent"]}; font-size:11px;')
-        hdr3.addWidget(self.lbl_band3)
+        self.combo_ch3 = QComboBox()
+        self.combo_ch3.setMinimumWidth(130)
+        self.combo_ch3.setMaximumHeight(22)
+        self.combo_ch3.setStyleSheet(self.combo_ch0.styleSheet())
+        self.combo_ch3.setToolTip('軌道 3 的 SKNA 來源通道')
+        self.combo_ch3.currentIndexChanged.connect(self._on_combo_ch3)
+        hdr3.addWidget(self.combo_ch3)
+        self.band_w3, self.spin_t3_lo, self.spin_t3_hi = self._band_widget(2)
+        self.band_w3.setVisible(True)
+        hdr3.addWidget(self.band_w3)
         for b in self._y_buttons(2):
             hdr3.addWidget(b)
         hdr3.addStretch()
@@ -3551,7 +3617,7 @@ class WaveformWidget(QWidget):
     def _populate_combos(self):
         if self.data is None:
             return
-        for combo in [self.combo_ch0, self.combo_ch1]:
+        for combo in [self.combo_ch0, self.combo_ch1, self.combo_ch3]:
             combo.blockSignals(True)
             combo.clear()
             for i in range(self.data.n_ch):
@@ -3566,7 +3632,48 @@ class WaveformWidget(QWidget):
         self._y_auto0 = True
         self._draw()
 
+    def _on_combo_ch3(self, idx: int):
+        cur = skna_band_cfg(self.skna_cfg, 2).get('src_ch')
+        if idx >= 0 and idx != cur:
+            self.skna_track_edit.emit({'src_ch2': idx})
+
+    def _on_band_edit(self, track: int):
+        lo_s, hi_s = ((self.spin_t2_lo, self.spin_t2_hi) if track == 1
+                      else (self.spin_t3_lo, self.spin_t3_hi))
+        lo, hi = lo_s.value(), hi_s.value()
+        if lo >= hi:
+            self._sync_skna_headers()     # 不合理的範圍就還原
+            return
+        keys = ('bp_lo', 'bp_hi') if track == 1 else ('bp_lo2', 'bp_hi2')
+        if (abs(lo - float(self.skna_cfg.get(keys[0], 0))) < 0.5 and
+                abs(hi - float(self.skna_cfg.get(keys[1], 0))) < 0.5):
+            return
+        self.skna_track_edit.emit({keys[0]: lo, keys[1]: hi})
+
+    def _sync_skna_headers(self):
+        """把目前 SKNA 設定（來源、帶通）同步到軌道 2／3 標題列。"""
+        cfg = self.skna_cfg
+        pairs = ((self.spin_t2_lo, cfg.get('bp_lo', 500.0)),
+                 (self.spin_t2_hi, cfg.get('bp_hi', 1000.0)),
+                 (self.spin_t3_lo, cfg.get('bp_lo2', 500.0)),
+                 (self.spin_t3_hi, cfg.get('bp_hi2', 1500.0)))
+        for s, v in pairs:
+            s.blockSignals(True); s.setValue(float(v)); s.blockSignals(False)
+        src2 = skna_band_cfg(cfg, 2).get('src_ch')
+        if src2 is not None and 0 <= src2 < self.combo_ch3.count():
+            self.combo_ch3.blockSignals(True)
+            self.combo_ch3.setCurrentIndex(src2)
+            self.combo_ch3.blockSignals(False)
+        s3 = cfg.get('method') == 's3'
+        self.spin_t2_lo.setToolTip('軌道 2 帶通低截止 (Hz)' + ('；S3 模式下只用於 BPF 欄位' if s3 else ''))
+        self.spin_t2_hi.setToolTip('軌道 2 帶通高截止 (Hz)' + ('；S3 模式下只用於 BPF 欄位' if s3 else ''))
+
     def _on_combo_ch1(self, idx: int):
+        if self.skna_enabled and self.skna_cfg.get('src_ch') is not None:
+            # SKNA 模式下這個選單就是軌道 2 的 SKNA 來源
+            if idx != self.skna_cfg.get('src_ch'):
+                self.skna_track_edit.emit({'src_ch': idx})
+            return
         self.ch_idx2 = idx
         self._y_auto1 = True
         self._draw()
@@ -3811,10 +3918,10 @@ class WaveformWidget(QWidget):
                 self.combo_ch1.blockSignals(True)
                 self.combo_ch1.setCurrentIndex(src)
                 self.combo_ch1.blockSignals(False)
-            self.combo_ch1.setEnabled(False)
-            self.combo_ch1.setToolTip(
-                'SKNA 模式下軌道 2 顯示的是分析結果，'
-                '來源通道請在「SKNA 設定」裡更改')
+            self.combo_ch1.setEnabled(True)
+            self.combo_ch1.setToolTip('軌道 2 的 SKNA 來源通道')
+            self.band_w2.setVisible(True)
+            self._sync_skna_headers()
         else:
             self.lbl_ch1.setText('軌道 2：')
             self.lbl_ch1.setStyleSheet(f'color:{C["dim"]}; font-size:11px;')
@@ -3827,6 +3934,7 @@ class WaveformWidget(QWidget):
                 self.combo_ch1.blockSignals(False)
             self.combo_ch1.setEnabled(True)
             self.combo_ch1.setToolTip('選擇軌道 2 顯示的通道')
+            self.band_w2.setVisible(False)
 
     def _track_plots(self):
         """目前看得到的波形軌道（畫點位、時間戳記、測量線、判讀框用）。"""
@@ -3857,7 +3965,7 @@ class WaveformWidget(QWidget):
         scale, unit = unit_to_uv(self.data.ch_units[ch])
         lo, hi, warn = skna_effective_band(fs, cfg['bp_lo'], cfg['bp_hi'])
         if band == 2:
-            self.lbl_band3.setText(f'BPF {lo:.0f}–{hi:.0f} Hz')
+            self._sync_skna_headers()
 
         use_s3 = (band == 1 and cfg.get('method') == 's3'
                   and self.s3_sna is not None)
@@ -5409,7 +5517,9 @@ class SknaSettingsDialog(QDialog):
         grp_ch = HelpGroupBox(
             '通道',
             'SKNA 來源通道：要拿來算 SKNA 的那一路訊號。取樣率要夠高，'
-            '頻寬才撐得住 500–1500 Hz 的帶通。\n\n'
+            '頻寬才撐得住 500–1500 Hz 的帶通。軌道 2 與軌道 3 可以用不同通道'
+            '（例如鎢針與皮膚電極），也可以直接在波形區的軌道標題列上切換。'
+            'S3 一律使用軌道 2 的來源。\n\n'
             'ECG 參考通道：只用來偵測 R-peak，供心率／心跳數統計，以及讓 S3 '
             '把每個心跳對齊排成矩陣。它不會參與 SKNA 的數值計算。\n\n'
             '下拉選單裡若標示 ⚠ 飽和／無訊號，代表該通道有相當比例的樣本'
@@ -5417,6 +5527,7 @@ class SknaSettingsDialog(QDialog):
         g = QGridLayout(grp_ch)
         g.setSpacing(8)
         self.combo_src = QComboBox()
+        self.combo_src2 = QComboBox()
         self.combo_ecg = QComboBox()
         self._sat = getattr(self.data, '_defect_report', None)
         if self._sat is None:
@@ -5433,14 +5544,20 @@ class SknaSettingsDialog(QDialog):
             label = (f'CH{i}: {self.data.ch_names[i]}  '
                      f'({self.data.fs_of(i):,.0f} Hz){warn}')
             self.combo_src.addItem(label)
+            self.combo_src2.addItem(label)
             self.combo_ecg.addItem(label)
         self.combo_src.setCurrentIndex(self._cfg.get('src_ch') or 0)
+        s2 = self._cfg.get('src_ch2')
+        self.combo_src2.setCurrentIndex(
+            s2 if s2 is not None else (self._cfg.get('src_ch') or 0))
         self.combo_ecg.setCurrentIndex(self._cfg.get('ecg_ch') or 0)
         self.combo_src.currentIndexChanged.connect(self._refresh_hint)
-        g.addWidget(QLabel('SKNA 來源通道：'), 0, 0)
+        g.addWidget(QLabel('SKNA 來源（軌道 2）：'), 0, 0)
         g.addWidget(self.combo_src, 0, 1)
-        g.addWidget(QLabel('ECG 參考通道：'), 1, 0)
-        g.addWidget(self.combo_ecg, 1, 1)
+        g.addWidget(QLabel('SKNA 來源（軌道 3）：'), 1, 0)
+        g.addWidget(self.combo_src2, 1, 1)
+        g.addWidget(QLabel('ECG 參考通道：'), 2, 0)
+        g.addWidget(self.combo_ecg, 2, 1)
         lay.addWidget(grp_ch)
 
         grp_m = HelpGroupBox(
@@ -5762,6 +5879,7 @@ class SknaSettingsDialog(QDialog):
         cfg = dict(self._cfg)
         cfg.update({
             'src_ch':        self.combo_src.currentIndex(),
+            'src_ch2':       self.combo_src2.currentIndex(),
             'ecg_ch':        self.combo_ecg.currentIndex(),
             'bp_lo':         self.spin_lo.value(),
             'bp_hi':         self.spin_hi.value(),
@@ -7256,7 +7374,10 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         ('通道數', data.n_ch),
         ('', ''),
         ('■ 分析通道', ''),
-        ('SKNA 來源通道', f"CH{src}: {data.ch_names[src]}"),
+        ('SKNA 來源通道（軌道 2）', f"CH{src}: {data.ch_names[src]}"),
+        ('SKNA 來源通道（軌道 3）',
+         (lambda s2_: f"CH{s2_}: {data.ch_names[s2_]}")(
+             skna_band_cfg(cfg, 2)['src_ch'])),
         ('來源通道取樣率 (Hz)', fs),
         ('來源通道原始單位', data.ch_units[src]),
         ('輸出單位', unit),
@@ -7533,6 +7654,7 @@ class MainWindow(QMainWindow):
         self.waveform.view_changed.connect(self._on_view_changed)
         self.waveform.peaks_edited.connect(self._on_peaks_edited)
         self.waveform.mark_clicked.connect(self._on_mark_clicked)
+        self.waveform.skna_track_edit.connect(self._on_skna_track_edit)
         splitter.addWidget(self.waveform)
 
         # 側邊面板
@@ -7788,6 +7910,7 @@ class MainWindow(QMainWindow):
             src, ecg = guess_skna_channels(self.ecg_data)
             self.skna_cfg = dict(SKNA_DEFAULTS)
             self.skna_cfg['src_ch'] = src
+            self.skna_cfg['src_ch2'] = src
             self.skna_cfg['ecg_ch'] = ecg
             self.s3_cache = None
             self.skna_rows = []
@@ -8092,8 +8215,30 @@ class MainWindow(QMainWindow):
             s3_state=('ready' if self._s3_is_valid() else 'none'))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        self._apply_skna_cfg(dlg.get_settings(), interactive=True)
+
+    def _on_skna_track_edit(self, upd: dict):
+        """在軌道標題列直接改了 SKNA 來源或帶通。"""
+        if self.ecg_data is None:
+            return
+        new = dict(self.skna_cfg)
+        new.update(upd)
+        n = len(self.skna_rows)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self._apply_skna_cfg(new, interactive=False)
+        finally:
+            QApplication.restoreOverrideCursor()
+        what = ('軌道 2' if ('src_ch' in upd or 'bp_lo' in upd) else '軌道 3')
+        self.lbl_status.setText(
+            f'已更新{what}：來源 / 帶通 = '
+            + (f"{skna_band_label(self.skna_cfg, 1)} Hz" if what == '軌道 2'
+               else f"{skna_band_label(self.skna_cfg, 2)} Hz")
+            + (f'，已重算 {n} 個區間' if n else ''))
+
+    def _apply_skna_cfg(self, new_cfg: dict, interactive: bool = True):
         old_key = s3_param_key(self.skna_cfg)
-        self.skna_cfg = dlg.get_settings()
+        self.skna_cfg = dict(new_cfg)
         self.waveform.skna_cfg = dict(self.skna_cfg)
         if self.s3_cache is not None and s3_param_key(self.skna_cfg) != old_key:
             self._invalidate_s3('通道或 S3 參數已變更')
@@ -8124,7 +8269,7 @@ class MainWindow(QMainWindow):
                         '才會有 S3 的數字；在那之前畫面與表格顯示的都還是'
                         '傳統帶通的結果。\n\n'
                         f'現在執行嗎？（預估約 {est} 秒）'
-                ) == QMessageBox.StandardButton.Yes:
+                ) == QMessageBox.StandardButton.Yes if interactive else False:
                     self._run_s3(True)
                 else:
                     self.lbl_status.setText(
