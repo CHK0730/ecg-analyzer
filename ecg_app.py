@@ -1353,7 +1353,7 @@ def apply_bandpass(y: np.ndarray, fs: float, lo_hz: float, hi_hz: float) -> np.n
 # （與文獻傳統作法一致）；若需要去除心電干擾，請改用 S3 分解模式。
 
 SKNA_PRESETS = {
-    '500–1500 Hz（高採樣率，預設）': (500.0, 1500.0),
+    '500–1500 Hz（高採樣率）': (500.0, 1500.0),
     '500–1000 Hz（文獻傳統值）':     (500.0, 1000.0),
     '300–500 Hz（Holter / 1 kHz）':  (300.0, 500.0),
 }
@@ -1361,8 +1361,10 @@ SKNA_PRESETS = {
 SKNA_DEFAULTS = {
     'src_ch':        None,     # SKNA 來源通道；None = 尚未設定
     'ecg_ch':        None,     # R-peak 參考通道
-    'bp_lo':         500.0,
-    'bp_hi':         1500.0,
+    'bp_lo':         500.0,    # 軌道 2 帶通
+    'bp_hi':         1000.0,
+    'bp_lo2':        500.0,    # 軌道 3 帶通
+    'bp_hi2':        1500.0,
     'order':         4,
     'env_ms':        100.0,    # 整流後移動平均窗長 (ms)
     'notch':         0.0,      # 額外工頻陷波（0 = 關閉）
@@ -1524,6 +1526,24 @@ def skna_effective_band(fs: float, bp_lo: float, bp_hi: float):
         warn = ((warn or '') +
                 f' 低截止過高，已自動降為 {lo:.0f} Hz。').strip()
     return lo, hi, warn
+
+
+def skna_band_cfg(cfg: dict, band: int = 1) -> dict:
+    """band=1 → 軌道 2 的帶通（bp_lo/bp_hi）；band=2 → 軌道 3（bp_lo2/bp_hi2）。
+
+    回傳的 cfg 一律把帶通放在 bp_lo/bp_hi，下游函式不必知道是哪一軌。
+    """
+    if band != 2:
+        return cfg
+    c = dict(cfg)
+    c['bp_lo'] = float(cfg.get('bp_lo2', 500.0))
+    c['bp_hi'] = float(cfg.get('bp_hi2', 1500.0))
+    return c
+
+
+def skna_band_label(cfg: dict, band: int = 1) -> str:
+    c = skna_band_cfg(cfg, band)
+    return f"{float(c.get('bp_lo', 500.0)):.0f}–{float(c.get('bp_hi', 1000.0)):.0f}"
 
 
 def compute_skna(y: np.ndarray, fs: float, bp_lo: float = 500.0,
@@ -1877,6 +1897,11 @@ def analyze_skna_interval(data, cfg: dict, t0: float, t1: float,
 
     m_all = skna_metrics(rsna, fs, scale)
 
+    # 軌道 3 的帶通（第二組 BPF）
+    cfg2 = skna_band_cfg(cfg, 2)
+    _t2, rsna2, _e2 = skna_segment(data, ch, t0, t1, cfg2)
+    m_all2 = skna_metrics(rsna2, fs, scale) if len(rsna2) else {}
+
     m_s3 = {}
     if s3_sig is not None:
         _t3, rsna3, _e3 = skna_segment(data, ch, t0, t1, cfg, sig=s3_sig)
@@ -1889,6 +1914,12 @@ def analyze_skna_interval(data, cfg: dict, t0: float, t1: float,
         if len(rsna_n):
             m_nact = skna_metrics(rsna_n, fs, scale)
             m_nact['n_win'] = n_win
+    m_nact2 = {}
+    if cfg.get('nact_compat'):
+        rsna_n2, n_win2 = skna_nerveact_compat(data, ch, t0, t1, cfg2)
+        if len(rsna_n2):
+            m_nact2 = skna_metrics(rsna_n2, fs, scale)
+            m_nact2['n_win'] = n_win2
 
     hr = np.nan
     rr_cv = np.nan
@@ -1936,6 +1967,8 @@ def analyze_skna_interval(data, cfg: dict, t0: float, t1: float,
         'ok': True, 't0': t0, 't1': t1, 'dur': t1 - t0,
         'unit': unit_lbl, 'fs': fs,
         'all': m_all, 's3': m_s3, 'nact': m_nact,
+        'all2': m_all2, 'nact2': m_nact2,
+        'band1': skna_band_label(cfg, 1), 'band2': skna_band_label(cfg, 2),
         'hr': hr, 'rr_cv': rr_cv, 'n_beat': n_beat,
         'sat_pct': sat_pct, 'flat_pct': flat_pct, 'bad_pct': bad_pct,
         'flags': flags,
@@ -2582,6 +2615,8 @@ class SidePanel(QWidget):
         src, ecg_ch = cfg['src_ch'], cfg['ecg_ch']
         fs = data.fs_of(src)
         lo, hi, warn = skna_effective_band(fs, cfg['bp_lo'], cfg['bp_hi'])
+        lo2, hi2, warn2 = skna_effective_band(fs, cfg.get('bp_lo2', 500.0),
+                                              cfg.get('bp_hi2', 1500.0))
         is_s3 = cfg.get('method') == 's3'
 
         self._set_kv(self.lbl_skna_method, '演算法',
@@ -2591,8 +2626,9 @@ class SidePanel(QWidget):
         self._set_kv(self.lbl_skna_ecg, 'ECG 參考',
                      f'CH{ecg_ch} {data.ch_names[ecg_ch]}')
         self._set_kv(self.lbl_skna_band, '帶通',
-                     f'{lo:.0f}–{hi:.0f} Hz' + ('  ⚠' if warn else '')
-                     + ('（僅 BPF 欄位）' if is_s3 else ''))
+                     f'軌2 {lo:.0f}–{hi:.0f}／軌3 {lo2:.0f}–{hi2:.0f} Hz'
+                     + ('  ⚠' if (warn or warn2) else '')
+                     + ('（軌2 為 S3）' if is_s3 else ''))
         self._set_kv(self.lbl_skna_env, '包絡窗長', f"{cfg['env_ms']:.0f} ms")
         if not is_s3:
             txt, col = '未使用', C['dim']
@@ -2625,15 +2661,21 @@ class SidePanel(QWidget):
             elif r.get('kind') == 'auto':
                 head = '⏱ ' + head
             body = f"{fmt_hms(r['t0'])} → {fmt_hms(r['t1'])}　({dur:.1f} s)"
+            # 側邊欄只有約 340 px：每個軌道一行 aSKNA，iSKNA 留給區間分析表
+            b1, b2 = res.get('band1', ''), res.get('band2', '')
             if val is not None and np.isfinite(val):
-                body += f"\n{tag} aSKNA {val:.3f} {unit}"
-                if ival is not None and np.isfinite(ival):
-                    # 另起一行：側邊欄只有約 340 px，跟 aSKNA 擠同一行會被截斷
-                    body += f"\n{tag} iSKNA {ival:.2f} {unit}·s"
+                body += (f"\nS3 aSKNA {val:.3f} {unit}" if tag == 'S3'
+                         else f"\nBPF {b1} aSKNA {val:.3f} {unit}")
+            a2 = res.get('all2', {}) if res.get('ok') else {}
+            v2 = a2.get('aSKNA')
+            if v2 is not None and np.isfinite(v2):
+                body += f"\nBPF {b2} aSKNA {v2:.3f} {unit}"
             na = res.get('nact', {}) if res.get('ok') else {}
-            nv = na.get('aSKNA')
+            na2 = res.get('nact2', {}) if res.get('ok') else {}
+            nv, nv2 = na.get('aSKNA'), na2.get('aSKNA')
             if nv is not None and np.isfinite(nv):
-                body += f"\nNerveact aSKNA {nv:.3f} {unit}"
+                body += f"\nNerveact aSKNA {nv:.3f}" + (
+                    f" / {nv2:.3f}" if nv2 is not None and np.isfinite(nv2) else '') + f" {unit}"
             flags = res.get('flags', [])
             if flags:
                 body += f"\n⚠ {'、'.join(flags)}"
@@ -3242,6 +3284,7 @@ class WaveformWidget(QWidget):
         self._y_auto         = True
         self._y_auto0        = True    # 軌道 1 是否處於自動縱軸縮放
         self._y_auto1        = True    # 軌道 2 是否處於自動縱軸縮放
+        self._y_auto2        = True    # 軌道 3（SKNA 第二帶通）自動縱軸縮放
         self.dual_mode       = True    # 預設雙通道顯示
         self.ch_idx2         = 1          # 第二軌道通道索引
         self._drawing        = False      # 防止重入
@@ -3267,7 +3310,7 @@ class WaveformWidget(QWidget):
         原本放在工具列，但它們是針對某一軌的操作，放在該軌的標題旁邊
         比較直覺，也不會在切換頁面時跟著消失。
         """
-        keys = ('W', 'S') if track == 0 else ('E', 'C')
+        keys = {0: ('W', 'S'), 1: ('E', 'C')}.get(track, ('', ''))
         style = (
             f'QPushButton{{background:{C["panel"]};color:{C["accent"]};'
             f'border:1px solid {C["border"]};border-radius:4px;'
@@ -3276,9 +3319,9 @@ class WaveformWidget(QWidget):
             f'QPushButton:pressed{{background:{C["accent"]};color:{C["bg"]}}}')
         out = []
         for text, tip, cb in (
-                ('▲', f'縱軸放大 ({keys[0]})',
+                ('▲', '縱軸放大' + (f' ({keys[0]})' if keys[0] else ''),
                  lambda _=0, t=track: self.zoom_y(2.0, t)),
-                ('▼', f'縱軸縮小 ({keys[1]})',
+                ('▼', '縱軸縮小' + (f' ({keys[1]})' if keys[1] else ''),
                  lambda _=0, t=track: self.zoom_y(0.5, t)),
                 ('自動', '縱軸自動縮放',
                  lambda _=0, t=track: self.reset_y(t))):
@@ -3363,7 +3406,35 @@ class WaveformWidget(QWidget):
         self.plot_wave2.setMinimumHeight(60)
         lay.addWidget(self.plot_wave2, stretch=2)
 
-        # ── RR tachogram（最下方）──
+        # ── 軌道 3：SKNA 第二組帶通（只在 SKNA 頁顯示，取代 RR 軌）──
+        hdr3 = QHBoxLayout()
+        hdr3.setContentsMargins(0, 2, 0, 0)
+        self.lbl_ch3 = QLabel('軌道 3（SKNA）：')
+        self.lbl_ch3.setStyleSheet(f'color:{C["orange"]}; font-size:11px;')
+        hdr3.addWidget(self.lbl_ch3)
+        self.lbl_band3 = QLabel('')
+        self.lbl_band3.setStyleSheet(f'color:{C["accent"]}; font-size:11px;')
+        hdr3.addWidget(self.lbl_band3)
+        for b in self._y_buttons(2):
+            hdr3.addWidget(b)
+        hdr3.addStretch()
+        self.hdr3_widget = QWidget()
+        self.hdr3_widget.setLayout(hdr3)
+        self.hdr3_widget.setVisible(False)
+        lay.addWidget(self.hdr3_widget)
+
+        self.plot_wave3 = PlotWidget()
+        self.plot_wave3.setLabel('left', '')
+        self.plot_wave3.setLabel('bottom', '時間 (s)')
+        self.plot_wave3.showGrid(x=True, y=True, alpha=0.2)
+        self.plot_wave3.setDownsampling(auto=True, mode='peak')
+        self.plot_wave3.scene().sigMouseClicked.connect(self._on_click3)
+        self.plot_wave3.getViewBox().setMouseEnabled(x=False, y=False)
+        self.plot_wave3.setVisible(False)
+        self.plot_wave3.setMinimumHeight(60)
+        lay.addWidget(self.plot_wave3, stretch=2)
+
+        # ── RR tachogram（最下方；SKNA 頁改顯示軌道 3）──
         self.plot_rr = PlotWidget()
         self.plot_rr.setLabel('left', 'RR (ms)')
         self.plot_rr.setLabel('bottom', '時間 (s)')
@@ -3376,7 +3447,7 @@ class WaveformWidget(QWidget):
         # 否則刻度文字長度不同（例如 300 vs -10），各圖的繪圖區起點會差好幾
         # 個像素，同一個時間點在不同軌道上的水平位置就對不起來，
         # 疊圖、點位線與波形之間的對照全都會歪掉。
-        for _pl in (self.plot_wave, self.plot_wave2, self.plot_rr):
+        for _pl in (self.plot_wave, self.plot_wave2, self.plot_wave3, self.plot_rr):
             _pl.getPlotItem().getAxis('left').setWidth(62)
             # 拖進來的檔案交給主視窗處理（詢問是否開啟新檔案）
             _pl.setAcceptDrops(False)
@@ -3389,6 +3460,10 @@ class WaveformWidget(QWidget):
         self._curve_skna_env = self.plot_wave2.plot(
             [], [], pen=pg.mkPen(C['orange'], width=1.8))
         self._curve_skna_env.setZValue(10)
+        self._curve_wave3 = self.plot_wave3.plot([], [], pen=pg.mkPen(C['wave_alt'], width=1.0))
+        self._curve_skna_env3 = self.plot_wave3.plot(
+            [], [], pen=pg.mkPen(C['orange'], width=1.8))
+        self._curve_skna_env3.setZValue(10)
         # S3 分離出的心電成分，疊在軌道 1 上用來確認分解是否合理
         self._curve_s3_ecg = self.plot_wave.plot(
             [], [], pen=pg.mkPen(C['red'], width=1.2))
@@ -3425,6 +3500,16 @@ class WaveformWidget(QWidget):
         self.plot_wave2.addItem(self._line_b2)
         self.plot_wave2.addItem(self._region_meas2)
 
+        # 測量線（軌道 3 上，同步）
+        self._line_a3 = InfiniteLine(pos=0, angle=90, pen=pg.mkPen(C['meas_a'] + 'cc', width=1.5))
+        self._line_b3 = InfiniteLine(pos=0, angle=90, pen=pg.mkPen(C['meas_b'] + 'cc', width=1.5))
+        self._region_meas3 = LinearRegionItem(
+            values=[0, 1], brush=pg.mkBrush(QColor(0, 0, 0, 0)), movable=False,
+            pen=pg.mkPen(QColor(0, 0, 0, 0)))
+        for _it in (self._line_a3, self._line_b3, self._region_meas3):
+            _it.setVisible(False)
+            self.plot_wave3.addItem(_it)
+
         # Slider 防抖動
         self._slider_timer = QTimer()
         self._slider_timer.setSingleShot(True)
@@ -3458,6 +3543,7 @@ class WaveformWidget(QWidget):
         self.measure_pts     = []
         self._y_auto0        = True
         self._y_auto1        = True
+        self._y_auto2        = True
         self._populate_combos()
         # 監聽 ViewBox 的 X 範圍變化（鼠標拖曳 / 滾輪縮放）
         self._draw()
@@ -3661,12 +3747,39 @@ class WaveformWidget(QWidget):
             self.hdr1_widget.setVisible(True)
             self._sync_hdr1()
             self.plot_rr.getPlotItem().getAxis('bottom').setStyle(showValues=False)
+            three = self.skna_enabled and self.skna_cfg.get('src_ch') is not None
         else:
             self._curve_wave2.setData([], [])
             self._curve_skna_env.setData([], [])
             self.plot_wave2.setVisible(False)
             self.hdr1_widget.setVisible(False)
             self.plot_rr.getPlotItem().getAxis('bottom').setStyle(showValues=True)
+            three = False
+
+        # ── 軌道 3：SKNA 第二組帶通，SKNA 頁取代 RR 軌 ──
+        if three:
+            t3, y3, env3 = self._draw_skna_track(t0, t1, MAX, band=2)
+            actual_vr = self.plot_wave.getViewBox().viewRange()
+            vb3 = self.plot_wave3.getViewBox()
+            vb3.blockSignals(True)
+            vb3.enableAutoRange(axis=vb3.XAxis, enable=False)
+            vb3.setRange(xRange=actual_vr[0], padding=0)
+            vb3.blockSignals(False)
+            self._curve_wave3.setData(t3, y3)
+            self._curve_skna_env3.setData(t3, env3)
+            if self._y_auto2:
+                self._auto_y_range(self.plot_wave3, y3)
+            self.plot_wave3.setVisible(True)
+            self.hdr3_widget.setVisible(True)
+            self.plot_rr.setVisible(False)
+            self.plot_wave2.getPlotItem().showAxis('bottom', False)
+        else:
+            self._curve_wave3.setData([], [])
+            self._curve_skna_env3.setData([], [])
+            self.plot_wave3.setVisible(False)
+            self.hdr3_widget.setVisible(False)
+            self.plot_rr.setVisible(True)
+            self.plot_wave2.getPlotItem().showAxis('bottom', True)
 
         # 更新測量線、時間戳記、點位、slider
         self._update_measure_lines()
@@ -3715,23 +3828,43 @@ class WaveformWidget(QWidget):
             self.combo_ch1.setEnabled(True)
             self.combo_ch1.setToolTip('選擇軌道 2 顯示的通道')
 
-    def _draw_skna_track(self, t0: float, t1: float, max_pts: int):
+    def _track_plots(self):
+        """目前看得到的波形軌道（畫點位、時間戳記、測量線、判讀框用）。"""
+        plots = [self.plot_wave]
+        if self.plot_wave2.isVisible() and self.dual_mode:
+            plots.append(self.plot_wave2)
+        if self.plot_wave3.isVisible():
+            plots.append(self.plot_wave3)
+        return plots
+
+    def _draw_skna_track(self, t0: float, t1: float, max_pts: int, band: int = 1):
+        """軌道 2（band=1）或軌道 3（band=2）畫 SKNA：rSNA 細線 + 整流包絡粗線。
+
+        軌道 3 一律是傳統帶通（第二組帶通設定）；S3 只顯示在軌道 2。
+"""
+        return self._draw_skna_track_impl(t0, t1, max_pts, band)
+
+    def _draw_skna_track_impl(self, t0: float, t1: float, max_pts: int, band: int = 1):
         """軌道 2 畫 SKNA：rSNA 細線 + 整流包絡粗線。
 
         回傳 (t, rsna, env)，皆已抽稀到可繪製的點數。抽稀用峰值法而不是
         等間隔取樣，否則 500–1500 Hz 的訊號會混疊、振幅看起來比實際小。
         """
-        cfg = self.skna_cfg
+        cfg = skna_band_cfg(self.skna_cfg, band)
+        plot = self.plot_wave3 if band == 2 else self.plot_wave2
         ch  = cfg['src_ch']
         fs  = self.data.fs_of(ch)
         scale, unit = unit_to_uv(self.data.ch_units[ch])
         lo, hi, warn = skna_effective_band(fs, cfg['bp_lo'], cfg['bp_hi'])
+        if band == 2:
+            self.lbl_band3.setText(f'BPF {lo:.0f}–{hi:.0f} Hz')
 
-        use_s3 = (cfg.get('method') == 's3' and self.s3_sna is not None)
+        use_s3 = (band == 1 and cfg.get('method') == 's3'
+                  and self.s3_sna is not None)
         t, rsna, env = skna_segment(self.data, ch, t0, t1, cfg,
                                     sig=(self.s3_sna if use_s3 else None))
         if len(t) == 0:
-            self._set_ylabel(self.plot_wave2, 'SKNA（此範圍無資料）')
+            self._set_ylabel(plot, 'SKNA（此範圍無資料）')
             return t, rsna, env
 
         rsna = rsna * scale
@@ -3746,11 +3879,11 @@ class WaveformWidget(QWidget):
         label = (f'SKNA [{tag}]　CH{ch}: {self.data.ch_names[ch]}　'
                  f'{band_txt}　({unit})　'
                  f'視窗 aSKNA = {a_win:.3f} {unit}')
-        if cfg.get('method') == 's3' and self.s3_sna is None:
+        if band == 1 and cfg.get('method') == 's3' and self.s3_sna is None:
             label += '　⚠ 尚未執行 S3 分解，顯示的是原始帶通結果'
         if warn and not use_s3:
             label += '　⚠ 已受 Nyquist 限制'
-        self._set_ylabel(self.plot_wave2, label)
+        self._set_ylabel(plot, label)
 
         if len(t) > max_pts:
             t_d, r_d = peak_decimate(t, rsna, max_pts)
@@ -3787,9 +3920,7 @@ class WaveformWidget(QWidget):
         if not hasattr(self, '_ts_mgr') or self._ts_mgr is None:
             return
 
-        plots = [self.plot_wave]
-        if self.dual_mode and self.plot_wave2.isVisible():
-            plots.append(self.plot_wave2)
+        plots = self._track_plots()
 
         # 只畫落在目前視窗裡的：匯入實驗記錄後常有上百筆戳記，每次平移都
         # 把全部重建一遍，光是建立 Qt 物件就會讓連發平移卡住
@@ -3853,6 +3984,7 @@ class WaveformWidget(QWidget):
         for line_a, line_b, region in [
             (self._line_a, self._line_b, self._region_meas),
             (self._line_a2, self._line_b2, self._region_meas2),
+            (self._line_a3, self._line_b3, self._region_meas3),
         ]:
             if show_a:
                 line_a.setPos(self.measure_pts[0])
@@ -3879,7 +4011,7 @@ class WaveformWidget(QWidget):
         # 畫新的頂端橫線
         if show_b:
             ta, tb = sorted(self.measure_pts)
-            for plot in [self.plot_wave] + ([self.plot_wave2] if self.dual_mode and self.plot_wave2.isVisible() else []):
+            for plot in self._track_plots():
                 vb  = plot.getViewBox()
                 vr  = plot.viewRange()
                 y_max = vr[1][1]
@@ -3991,9 +4123,11 @@ class WaveformWidget(QWidget):
         # 手動調整過就不要再被自動縮放蓋掉，直到按「自動」為止
         if ch == 0:
             self._y_auto0 = False
-        else:
+        elif ch == 1:
             self._y_auto1 = False
-        plot = self.plot_wave if ch == 0 else self.plot_wave2
+        else:
+            self._y_auto2 = False
+        plot = {0: self.plot_wave, 1: self.plot_wave2}.get(ch, self.plot_wave3)
         vr = plot.viewRange()
         y_min, y_max = vr[1]
         y_center = (y_min + y_max) / 2
@@ -4006,8 +4140,10 @@ class WaveformWidget(QWidget):
             return
         if ch == 0:
             self._y_auto0 = True
-        else:
+        elif ch == 1:
             self._y_auto1 = True
+        else:
+            self._y_auto2 = True
         self._draw()
 
     @staticmethod
@@ -4034,7 +4170,9 @@ class WaveformWidget(QWidget):
                 lo = min(lo, float(ex.min()))
                 hi = max(hi, float(ex.max()))
         span = hi - lo
-        if span <= 0:
+        # 帶通遇到完全平坦（飽和）的輸入時，輸出是 1e-14 等級的浮點殘值，
+        # 實際上就是 0；若照常自動縮放會把這些殘值放大成滿版雜訊
+        if span <= max(1e-9, max(abs(lo), abs(hi)) * 1e-9):
             # 完全是常數：以該值為中心給一個相對寬度，至少看得到那條線
             pad = max(abs(hi) * 1e-4, 1e-6)
         else:
@@ -4096,6 +4234,9 @@ class WaveformWidget(QWidget):
 
     def _on_click2(self, event):
         self._handle_click(event, self.plot_wave2)
+
+    def _on_click3(self, event):
+        self._handle_click(event, self.plot_wave3)
 
     def _handle_click(self, event, plot):
         if not (self.measure_mode or self.peak_edit_mode or self.mark_mode):
@@ -4244,9 +4385,7 @@ class WaveformWidget(QWidget):
         if self.data is None or (not self.review_regions and self.review_cur is None):
             return
         v0, v1 = self.t_start, self.t_end
-        plots = [self.plot_wave]
-        if self.dual_mode and self.plot_wave2.isVisible():
-            plots.append(self.plot_wave2)
+        plots = self._track_plots()
         spans = [(a, b, pg.mkBrush(248, 81, 73, 55), None)
                  for a, b, st in self.review_regions
                  if st == 'artifact' and b > v0 and a < v1]
@@ -4284,9 +4423,7 @@ class WaveformWidget(QWidget):
         if self.data is None or not self.marks:
             return
         t0, t1 = self.t_start, self.t_end
-        plots = [self.plot_wave]
-        if self.dual_mode and self.plot_wave2.isVisible():
-            plots.append(self.plot_wave2)
+        plots = self._track_plots()
         for m in self.marks:
             t = float(m.get('t', 0.0))
             if not (t0 - 1e-9 <= t <= t1 + 1e-9):
@@ -5374,10 +5511,13 @@ class SknaSettingsDialog(QDialog):
 
         self._bp_help = (
             '把原始訊號帶通到神經活性所在的頻帶，得到 rSNA。\n\n'
+            'SKNA 頁有兩個 SKNA 軌道，各有自己的帶通：軌道 2（預設 500–1000 Hz）'
+            '與軌道 3（預設 500–1500 Hz）。區間分析、Artifact 判讀與匯出的 Excel '
+            '會同時計算兩組。選 S3 時軌道 2 改顯示 S3 輸出，軌道 3 仍為帶通。\n\n'
             '預設值：\n'
             '  500–1000 Hz — Kusayama 2020 Nature Protocols 的標準設定，'
             '要對照文獻數值請用這一組。\n'
-            '  500–1500 Hz — 本程式預設，高採樣率錄製時頻寬利用較完整；'
+            '  500–1500 Hz — 高採樣率錄製時頻寬利用較完整；'
             '實測 aSKNA 會比 500–1000 高約 16%。\n'
             '  300–500 Hz — Holter 等 1 kHz 採樣設備適用。\n\n'
             '階數：Butterworth 濾波器階數，以 SOS 形式、零相位（sosfiltfilt）'
@@ -5387,28 +5527,40 @@ class SknaSettingsDialog(QDialog):
         self._bp_badge = grp_bp.badge
         v = QVBoxLayout(grp_bp)
         v.setSpacing(8)
-        row_p = QHBoxLayout()
-        row_p.addWidget(QLabel('預設值：'))
+        def _spin(val):
+            s_ = QDoubleSpinBox(); s_.setRange(1, 20000)
+            s_.setDecimals(0); s_.setSingleStep(50); s_.setValue(float(val))
+            s_.valueChanged.connect(self._refresh_hint)
+            return s_
+
+        gb = QGridLayout(); gb.setSpacing(6)
+        gb.addWidget(QLabel('預設值'), 0, 1)
+        gb.addWidget(QLabel('低截止 (Hz)'), 0, 2)
+        gb.addWidget(QLabel('高截止 (Hz)'), 0, 3)
         self.combo_preset = QComboBox()
         self.combo_preset.addItems(list(SKNA_PRESETS.keys()) + ['自訂'])
         self.combo_preset.currentTextChanged.connect(self._on_preset)
-        row_p.addWidget(self.combo_preset, 1)
-        v.addLayout(row_p)
+        self.combo_preset2 = QComboBox()
+        self.combo_preset2.addItems(list(SKNA_PRESETS.keys()) + ['自訂'])
+        self.combo_preset2.currentTextChanged.connect(self._on_preset2)
+        self.spin_lo = _spin(self._cfg.get('bp_lo', 500.0))
+        self.spin_hi = _spin(self._cfg.get('bp_hi', 1000.0))
+        self.spin_lo2 = _spin(self._cfg.get('bp_lo2', 500.0))
+        self.spin_hi2 = _spin(self._cfg.get('bp_hi2', 1500.0))
+        for r_, (lbl_, cb_, lo_, hi_) in enumerate((
+                ('軌道 2：', self.combo_preset, self.spin_lo, self.spin_hi),
+                ('軌道 3：', self.combo_preset2, self.spin_lo2, self.spin_hi2)), 1):
+            gb.addWidget(QLabel(lbl_), r_, 0)
+            gb.addWidget(cb_, r_, 1)
+            gb.addWidget(lo_, r_, 2)
+            gb.addWidget(hi_, r_, 3)
+        gb.setColumnStretch(1, 1)
+        v.addLayout(gb)
 
         row_f = QHBoxLayout()
-        self.spin_lo = QDoubleSpinBox(); self.spin_lo.setRange(1, 20000)
-        self.spin_lo.setDecimals(0); self.spin_lo.setSingleStep(50)
-        self.spin_lo.setValue(self._cfg.get('bp_lo', 500.0))
-        self.spin_hi = QDoubleSpinBox(); self.spin_hi.setRange(1, 20000)
-        self.spin_hi.setDecimals(0); self.spin_hi.setSingleStep(50)
-        self.spin_hi.setValue(self._cfg.get('bp_hi', 1500.0))
         self.spin_ord = QSpinBox(); self.spin_ord.setRange(2, 8)
         self.spin_ord.setValue(int(self._cfg.get('order', 4)))
-        for w_ in (self.spin_lo, self.spin_hi):
-            w_.valueChanged.connect(self._refresh_hint)
-        row_f.addWidget(QLabel('低截止')); row_f.addWidget(self.spin_lo)
-        row_f.addWidget(QLabel('Hz    高截止')); row_f.addWidget(self.spin_hi)
-        row_f.addWidget(QLabel('Hz    階數')); row_f.addWidget(self.spin_ord)
+        row_f.addWidget(QLabel('階數（兩軌共用）')); row_f.addWidget(self.spin_ord)
         row_f.addStretch()
         v.addLayout(row_f)
 
@@ -5539,15 +5691,17 @@ class SknaSettingsDialog(QDialog):
         self.resize(int(w), int(h))
 
     def _sync_preset(self):
-        cur = (self.spin_lo.value(), self.spin_hi.value())
-        self.combo_preset.blockSignals(True)
-        target = '自訂'
-        for name, band in SKNA_PRESETS.items():
-            if abs(band[0] - cur[0]) < 0.5 and abs(band[1] - cur[1]) < 0.5:
-                target = name
-                break
-        self.combo_preset.setCurrentText(target)
-        self.combo_preset.blockSignals(False)
+        for combo, s_lo, s_hi in ((self.combo_preset, self.spin_lo, self.spin_hi),
+                                  (self.combo_preset2, self.spin_lo2, self.spin_hi2)):
+            cur = (s_lo.value(), s_hi.value())
+            combo.blockSignals(True)
+            target = '自訂'
+            for name, band in SKNA_PRESETS.items():
+                if abs(band[0] - cur[0]) < 0.5 and abs(band[1] - cur[1]) < 0.5:
+                    target = name
+                    break
+            combo.setCurrentText(target)
+            combo.blockSignals(False)
 
     def _on_preset(self, name: str):
         if name in SKNA_PRESETS:
@@ -5556,11 +5710,20 @@ class SknaSettingsDialog(QDialog):
             self.spin_hi.setValue(hi)
         self._refresh_hint()
 
+    def _on_preset2(self, name: str):
+        if name in SKNA_PRESETS:
+            lo, hi = SKNA_PRESETS[name]
+            self.spin_lo2.setValue(lo)
+            self.spin_hi2.setValue(hi)
+        self._refresh_hint()
+
     def _refresh_hint(self, *_):
         ch = self.combo_src.currentIndex()
         fs = self.data.fs_of(ch)
         lo, hi, warn = skna_effective_band(fs, self.spin_lo.value(),
                                            self.spin_hi.value())
+        lo2, hi2, warn2 = skna_effective_band(fs, self.spin_lo2.value(),
+                                              self.spin_hi2.value())
         scale, unit = unit_to_uv(self.data.ch_units[ch])
         # 目前通道的基本資訊屬於「說明」，收進標題旁的問號裡；
         # 外面只留跟這筆資料有關的警告，不能藏起來。
@@ -5569,7 +5732,8 @@ class SknaSettingsDialog(QDialog):
                 f'目前來源 CH{ch}：fs = {fs:,.0f} Hz'
                 f'（Nyquist {fs / 2:,.0f} Hz），'
                 f'原始單位 {self.data.ch_units[ch]} → 輸出以 {unit} 表示。'
-                f'實際生效帶通 {lo:.0f}–{hi:.0f} Hz。\n\n'
+                f'實際生效帶通：軌道 2 {lo:.0f}–{hi:.0f} Hz、'
+                f'軌道 3 {lo2:.0f}–{hi2:.0f} Hz。\n\n'
                 + self._bp_help)
 
         msgs = []
@@ -5584,7 +5748,9 @@ class SknaSettingsDialog(QDialog):
                 '那些區段沒有訊號內容，算出來的 aSKNA 不具物理意義，'
                 'S3 也無法分解。建議改用其他通道，或只分析正常的時間範圍。')
         if warn:
-            msgs.append('⚠ ' + warn)
+            msgs.append('⚠ 軌道 2：' + warn)
+        if warn2:
+            msgs.append('⚠ 軌道 3：' + warn2)
         if unit != 'µV':
             msgs.append('⚠ 無法辨識的單位，數值不做換算，直接沿用原單位。')
         self.lbl_hint.setText('  '.join(msgs))
@@ -5599,6 +5765,8 @@ class SknaSettingsDialog(QDialog):
             'ecg_ch':        self.combo_ecg.currentIndex(),
             'bp_lo':         self.spin_lo.value(),
             'bp_hi':         self.spin_hi.value(),
+            'bp_lo2':        self.spin_lo2.value(),
+            'bp_hi2':        self.spin_hi2.value(),
             'order':         int(self.spin_ord.value()),
             'env_ms':        self.spin_env.value(),
             'rpeak_source':  ('screen' if self.combo_rsrc.currentIndex() == 1
@@ -5876,11 +6044,8 @@ class AutoWindowDialog(QDialog):
         vr.addWidget(self.rb_count, 2, 0); vr.addWidget(self.spin_count, 2, 1)
         self.combo_pt_start = self._point_combo('起點')
         self.combo_pt_end = self._point_combo('終點')
-        vr.addWidget(self.rb_range, 3, 0)
-        rr = QHBoxLayout()
-        rr.addWidget(QLabel('到')); rr.addWidget(self.ed_end)
-        rr.addWidget(self.combo_pt_end, 1)
-        vr.addLayout(rr, 3, 1, 1, 2)
+        vr.addWidget(self.rb_range, 3, 0, 1, 3)
+        # 起點在上、終點在下（起點也用於「總共計算」「共計算」兩種模式）
         vr.addWidget(QLabel('起點：'), 4, 0)
         rs = QHBoxLayout()
         rs.addWidget(self.ed_start); rs.addWidget(self.combo_pt_start, 1)
@@ -5888,9 +6053,14 @@ class AutoWindowDialog(QDialog):
         self.lbl_start_note = QLabel('')
         self.lbl_start_note.setStyleSheet(f'color:{C["dim"]};font-size:11px;')
         vr.addWidget(self.lbl_start_note, 5, 1, 1, 2)
+        self.lbl_end = QLabel('終點：')
+        vr.addWidget(self.lbl_end, 6, 0)
+        rr = QHBoxLayout()
+        rr.addWidget(self.ed_end); rr.addWidget(self.combo_pt_end, 1)
+        vr.addLayout(rr, 6, 1, 1, 2)
         self.chk_partial = QCheckBox('最後不足一段長度時捨去')
         self.chk_partial.setChecked(True)
-        vr.addWidget(self.chk_partial, 6, 0, 1, 3)
+        vr.addWidget(self.chk_partial, 7, 0, 1, 3)
         self.combo_pt_start.activated.connect(self._on_pick_start)
         self.combo_pt_end.activated.connect(self._on_pick_end)
         self.ed_start.textEdited.connect(lambda *_: self.combo_pt_start.setCurrentIndex(0))
@@ -6046,6 +6216,7 @@ class AutoWindowDialog(QDialog):
         self.spin_total.setEnabled(mode == 1)
         self.spin_count.setEnabled(mode == 2)
         self.ed_end.setEnabled(mode == 3)
+        self.lbl_end.setEnabled(mode == 3)
         st = parse_time_str(self.ed_start.text())
         self.lbl_start_note.setText(
             f'（時鐘 {self.data.abs_time(st)}）' if (st is not None and mode != 0
@@ -6297,15 +6468,20 @@ class ArtifactReviewDialog(QDialog):
         res = r.get('res') or {}
         a = res.get('all', {}) if res.get('ok') else {}
         na = res.get('nact', {}) if res.get('ok') else {}
+        a2 = res.get('all2', {}) if res.get('ok') else {}
+        na2 = res.get('nact2', {}) if res.get('ok') else {}
         unit = res.get('unit', 'µV')
         self.lbl_pos.setText(f'第 {self.i + 1} / {n} 段　｜　{r.get("label", "")}')
         self.lbl_time.setText(f"{fmt_hms(r['t0'])} → {fmt_hms(r['t1'])}"
                               f"（{r['t1'] - r['t0']:.1f} s）")
         parts = []
-        if a.get('aSKNA') is not None:
-            parts.append(f"BPF aSKNA {a['aSKNA']:.3f} {unit}")
+        for m_, b_ in ((a, res.get('band1', '')), (a2, res.get('band2', ''))):
+            if m_.get('aSKNA') is not None:
+                parts.append(f"BPF {b_} aSKNA {m_['aSKNA']:.3f} {unit}")
         if na.get('aSKNA') is not None:
-            parts.append(f"Nerveact aSKNA {na['aSKNA']:.3f} {unit}")
+            parts.append(f"Nerveact aSKNA {na['aSKNA']:.3f}"
+                         + (f" / {na2['aSKNA']:.3f}" if na2.get('aSKNA') is not None else '')
+                         + f" {unit}")
         flags = res.get('flags', [])
         if flags:
             parts.append('⚠ ' + '、'.join(flags))
@@ -6335,7 +6511,7 @@ class ArtifactReviewDialog(QDialog):
 class SknaIntervalDialog(QDialog):
     """SKNA 區間分析表格 + Excel 匯出。"""
 
-    N_COLS = 17
+    N_COLS = 21
 
     def _col_labels(self):
         """表格欄位標題。振幅類欄位的單位取決於來源通道，所以動態產生。"""
@@ -6346,11 +6522,14 @@ class SknaIntervalDialog(QDialog):
                 _, u = unit_to_uv(d.ch_units[cfg['src_ch']])
             except Exception:
                 pass
+        b1, b2 = skna_band_label(cfg, 1), skna_band_label(cfg, 2)
         return ['標籤', '起始', '結束', '時長 (s)', 'HR (bpm)', '心跳數',
-                f'BPF aSKNA\n({u})', f'BPF iSKNA\n({u}·s)',
+                f'BPF {b1}\naSKNA ({u})', f'BPF {b1}\niSKNA ({u}·s)',
+                f'BPF {b2}\naSKNA ({u})', f'BPF {b2}\niSKNA ({u}·s)',
                 f'S3 aSKNA\n({u})', f'S3 iSKNA\n({u}·s)',
                 f'S3 RMS\n({u})', f'S3 Peak\n({u})',
-                f'Nerveact\naSKNA ({u})', f'Nerveact\niSKNA ({u}·s)',
+                f'Nerveact {b1}\naSKNA ({u})', f'Nerveact {b1}\niSKNA ({u}·s)',
+                f'Nerveact {b2}\naSKNA ({u})', f'Nerveact {b2}\niSKNA ({u}·s)',
                 '無效訊號 (%)', '品質', '判讀']
 
     def __init__(self, parent, main_window):
@@ -6497,7 +6676,8 @@ class SknaIntervalDialog(QDialog):
         _, unit = unit_to_uv(d.ch_units[src])
         txt = (f"來源 CH{src}: {d.ch_names[src]} ({fs:,.0f} Hz)　|　"
                f"ECG 參考 CH{ecg}: {d.ch_names[ecg]}　|　"
-               f"帶通 {lo:.0f}–{hi:.0f} Hz ({cfg['order']} 階)　|　"
+               f"帶通 軌道2 {lo:.0f}–{hi:.0f}／軌道3 {skna_band_label(cfg, 2)} Hz"
+               f" ({cfg['order']} 階)　|　"
                f"包絡 {cfg['env_ms']:.0f} ms　|　單位 {unit}")
         c3 = self.mw.s3_cache
         if c3 is not None and self.mw._s3_is_valid():
@@ -6687,6 +6867,8 @@ class SknaIntervalDialog(QDialog):
             a = res.get('all', {}) if res.get('ok') else {}
             s3 = res.get('s3', {}) if res.get('ok') else {}
             na = res.get('nact', {}) if res.get('ok') else {}
+            a2 = res.get('all2', {}) if res.get('ok') else {}
+            na2 = res.get('nact2', {}) if res.get('ok') else {}
             t0s = d.abs_time(r['t0']) if d else fmt_hms(r['t0'])
             t1s = d.abs_time(r['t1']) if d else fmt_hms(r['t1'])
             hr = res.get('hr', float('nan'))
@@ -6699,9 +6881,11 @@ class SknaIntervalDialog(QDialog):
                 ('—' if not np.isfinite(hr) else f'{hr:.0f}'),
                 str(res.get('n_beat', 0)),
                 self._fmt(a.get('aSKNA')), self._fmt(a.get('iSKNA'), 2),
+                self._fmt(a2.get('aSKNA')), self._fmt(a2.get('iSKNA'), 2),
                 self._fmt(s3.get('aSKNA')), self._fmt(s3.get('iSKNA'), 2),
                 self._fmt(s3.get('RMS')), self._fmt(s3.get('peak')),
                 self._fmt(na.get('aSKNA')), self._fmt(na.get('iSKNA'), 2),
+                self._fmt(na2.get('aSKNA')), self._fmt(na2.get('iSKNA'), 2),
                 self._fmt(res.get('bad_pct'), 1),
                 ('✓' if not flags else '⚠ ' + '、'.join(flags)),
                 JUDGE_LABEL.get(r.get('judge'), '保留'),
@@ -6962,6 +7146,11 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
     src = cfg['src_ch']
     fs = data.fs_of(src)
     lo, hi, warn = skna_effective_band(fs, cfg['bp_lo'], cfg['bp_hi'])
+    lo2, hi2, warn2 = skna_effective_band(fs, cfg.get('bp_lo2', 500.0),
+                                          cfg.get('bp_hi2', 1500.0))
+    if warn2:
+        warn = ((warn + '；') if warn else '') + '軌道 3：' + warn2
+    b1, b2 = skna_band_label(cfg, 1), skna_band_label(cfg, 2)
     _, unit = unit_to_uv(data.ch_units[src])
 
     wb = openpyxl.Workbook()
@@ -6971,14 +7160,19 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         ('標籤', 16), ('起始 (s)', 11), ('結束 (s)', 11), ('時長 (s)', 10),
         ('起始時刻', 13), ('結束時刻', 13),
         ('心跳數', 8), ('平均 HR (bpm)', 13), ('RR CV (%)', 10),
-        (f'BPF aSKNA ({unit})', 16), (f'BPF iSKNA ({unit}·s)', 17),
-        (f'BPF RMS ({unit})', 14), (f'BPF Peak ({unit})', 15),
-        (f'BPF SD ({unit})', 14),
+        (f'BPF {b1} aSKNA ({unit})', 17), (f'BPF {b1} iSKNA ({unit}·s)', 18),
+        (f'BPF {b1} RMS ({unit})', 15), (f'BPF {b1} Peak ({unit})', 16),
+        (f'BPF {b1} SD ({unit})', 15),
+        (f'BPF {b2} aSKNA ({unit})', 17), (f'BPF {b2} iSKNA ({unit}·s)', 18),
+        (f'BPF {b2} RMS ({unit})', 15), (f'BPF {b2} Peak ({unit})', 16),
+        (f'BPF {b2} SD ({unit})', 15),
         (f'S3 aSKNA ({unit})', 15), (f'S3 iSKNA ({unit}·s)', 16),
         (f'S3 RMS ({unit})', 13), (f'S3 Peak ({unit})', 14),
         (f'S3 SD ({unit})', 13),
-        (f'Nerveact 相容 aSKNA ({unit})', 18),
-        (f'Nerveact 相容 iSKNA ({unit}·s)', 19),
+        (f'Nerveact {b1} aSKNA ({unit})', 18),
+        (f'Nerveact {b1} iSKNA ({unit}·s)', 19),
+        (f'Nerveact {b2} aSKNA ({unit})', 18),
+        (f'Nerveact {b2} iSKNA ({unit}·s)', 19),
         ('無效訊號 (%)', 12), ('R-peak 來源', 28), ('品質警示', 24),
         ('判讀', 10),
     ]
@@ -6996,6 +7190,7 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
     ws.freeze_panes = 'A2'
     ws.row_dimensions[1].height = 32
 
+    pct_col = [h for h, _ in headers].index('無效訊號 (%)') + 1
     warn_font = Font(color='9C6500')
     art_fill = PatternFill('solid', fgColor='FCE4D6')
     for i, r in enumerate(rows, start=2):
@@ -7003,6 +7198,8 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         a = res.get('all', {}) if res.get('ok') else {}
         s3 = res.get('s3', {}) if res.get('ok') else {}
         na = res.get('nact', {}) if res.get('ok') else {}
+        a2 = res.get('all2', {}) if res.get('ok') else {}
+        na2 = res.get('nact2', {}) if res.get('ok') else {}
         flags = res.get('flags', [])
 
         def num(v):
@@ -7021,9 +7218,12 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
             res.get('n_beat', 0), num(res.get('hr')), num(res.get('rr_cv')),
             num(a.get('aSKNA')), num(a.get('iSKNA')),
             num(a.get('RMS')), num(a.get('peak')), num(a.get('SD')),
+            num(a2.get('aSKNA')), num(a2.get('iSKNA')),
+            num(a2.get('RMS')), num(a2.get('peak')), num(a2.get('SD')),
             num(s3.get('aSKNA')), num(s3.get('iSKNA')),
             num(s3.get('RMS')), num(s3.get('peak')), num(s3.get('SD')),
             num(na.get('aSKNA')), num(na.get('iSKNA')),
+            num(na2.get('aSKNA')), num(na2.get('iSKNA')),
             num(res.get('bad_pct')),
             r.get('src', ''),
             ('、'.join(flags) if flags else ''),
@@ -7032,7 +7232,7 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         for j, v in enumerate(vals, start=1):
             c = ws.cell(row=i, column=j, value=v)
             if isinstance(v, float):
-                c.number_format = '0.0' if j in (8, 9, 22) else '0.0000'
+                c.number_format = '0.0' if j in (8, 9, pct_col) else '0.0000'
             if j == len(vals) - 1 and flags:
                 c.font = warn_font
             if r.get('judge') == 'artifact':
@@ -7065,8 +7265,8 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         ('ECG 參考取樣率 (Hz)', data.fs_of(cfg['ecg_ch'])),
         ('', ''),
         ('■ 訊號處理', ''),
-        ('帶通設定 (Hz)', f"{cfg['bp_lo']:.0f} – {cfg['bp_hi']:.0f}"),
-        ('帶通實際生效 (Hz)', f"{lo:.0f} – {hi:.0f}"),
+        ('帶通設定 (Hz)', f"軌道 2：{b1}；軌道 3：{b2}"),
+        ('帶通實際生效 (Hz)', f"軌道 2：{lo:.0f} – {hi:.0f}；軌道 3：{lo2:.0f} – {hi2:.0f}"),
         ('濾波器',
          f"Butterworth {cfg['order']} 階，SOS 形式，零相位 (sosfiltfilt)"),
         ('整流方式', '全波整流 |rSNA|'),
@@ -7162,10 +7362,9 @@ def _add_judge_summary(wb, ws, headers, n_rows: int, unit: str, cfg: dict):
     col = {h: names.index(h) + 1 for h in names}
     jcol = L(col['判讀'])
     last = n_rows + 1
-    metrics = [(f'BPF aSKNA ({unit})', 'BPF aSKNA'),
-               (f'BPF iSKNA ({unit}·s)', 'BPF iSKNA'),
-               (f'Nerveact 相容 aSKNA ({unit})', 'Nerveact 相容 aSKNA'),
-               (f'Nerveact 相容 iSKNA ({unit}·s)', 'Nerveact 相容 iSKNA')]
+    # 兩個軌道的 BPF 與 Nerveact 相容 aSKNA / iSKNA（S3 不在判讀範圍）
+    metrics = [(h, h.rsplit(' (', 1)[0]) for h in names
+               if (' aSKNA' in h or ' iSKNA' in h) and not h.startswith('S3')]
     hdr_fill = PatternFill('solid', fgColor='1F3864')
     hdr_font = Font(bold=True, color='FFFFFF', size=10)
     helper = {}
@@ -7192,7 +7391,7 @@ def _add_judge_summary(wb, ws, headers, n_rows: int, unit: str, cfg: dict):
     q = "'SKNA Intervals'!"
     sm['A1'] = 'SKNA 總表（人工 Artifact 判讀）'
     sm['A1'].font = Font(bold=True, size=13, color='1F3864')
-    sm['A2'] = (f"帶通 {cfg['bp_lo']:.0f}–{cfg['bp_hi']:.0f} Hz（BPF）。"
+    sm['A2'] = (f"帶通：軌道 2 {skna_band_label(cfg, 1)} Hz、軌道 3 {skna_band_label(cfg, 2)} Hz（BPF）。"
                 '判讀僅適用 BPF 與 Nerveact 相容欄位；在 SKNA Intervals 的「判讀」'
                 '欄修改後，本頁自動重算。')
     jr = f'{q}${jcol}$2:${jcol}${last}'
@@ -7223,7 +7422,7 @@ def _add_judge_summary(wb, ws, headers, n_rows: int, unit: str, cfg: dict):
         for j, v in enumerate(vals, 1):
             c = sm.cell(row=r, column=j, value=v)
             c.number_format = '0.0%' if j == 10 else ('0' if j in (5, 9) else '0.0000')
-    sm.cell(row=hr + 6, column=1,
+    sm.cell(row=hr + len(metrics) + 2, column=1,
             value='註：Nerveact 相容欄位只有在 SKNA 設定開啟「Nerveact 相容模式」時才有數值。'
                   '未標記為 Artifact 的區段一律視為保留。')
     for j, w in enumerate([22, 12, 11, 12, 8, 15, 14, 15, 13, 10], 1):
@@ -7878,7 +8077,7 @@ class MainWindow(QMainWindow):
             meth = 'S3 ✓' if ok else 'S3（待分解）'
         else:
             meth = 'BPF'
-        txt = f'  {meth} | CH{src} | {lo:.0f}–{hi:.0f} Hz'
+        txt = f'  {meth} | CH{src} | {lo:.0f}–{hi:.0f}／{skna_band_label(cfg, 2)} Hz'
         if warn:
             txt += ' ⚠'
         self.lbl_skna_state.setText(txt)
