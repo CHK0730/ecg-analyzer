@@ -6760,17 +6760,30 @@ class ArtifactReviewDialog(QDialog):
         n_art = sum(1 for k in range(n) if self._state(k) == 'artifact')
         self.lbl_count.setText(f"保留 {n - n_art}　Artifact {n_art}　（共 {n} 段）")
 
-    def closeEvent(self, ev):
+    def _finish(self):
+        """判讀結束的清理。按「完成」、視窗關閉鈕或 Esc 都會走到這裡；
+        Esc 走的是 reject() → done()，不會觸發 closeEvent，所以兩邊都要接。"""
+        if getattr(self, '_finished', False):
+            return
+        self._finished = True
         self.mw._review_cur = None
-        self.mw._update_review_overlay()
         self.mw.review_dlg = None
-        super().closeEvent(ev)
+        # 紅色 Artifact 標記與橘色框只在判讀時顯示，結束後全部清掉
+        self.mw._update_review_overlay()
         # 從「SKNA 區間分析」進來時那個視窗先收起來，判讀完再叫回來
         if getattr(self.mw, '_review_restore_dlg', False) and self.mw.skna_dlg is not None:
             self.mw._review_restore_dlg = False
             self.mw.skna_dlg._rebuild_table()
             self.mw.skna_dlg.show()
             self.mw.skna_dlg.raise_()
+
+    def closeEvent(self, ev):
+        super().closeEvent(ev)
+        self._finish()
+
+    def done(self, r):
+        super().done(r)
+        self._finish()
 
 
 class SknaIntervalDialog(QDialog):
@@ -8744,7 +8757,9 @@ class MainWindow(QMainWindow):
     def _update_review_overlay(self):
         if not hasattr(self, 'waveform'):
             return
-        if self.ecg_data is None or getattr(self, 'page', 0) != 1:
+        # 只在 Artifact 判讀視窗開著時標示；關掉之後畫面不留紅底與框
+        if (self.ecg_data is None or getattr(self, 'page', 0) != 1
+                or (self.review_dlg is None and self._review_cur is None)):
             self.waveform.set_review([], None)
             return
         regions = [(r['t0'], r['t1'],
