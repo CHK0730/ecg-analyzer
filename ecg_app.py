@@ -2605,7 +2605,7 @@ class SidePanel(QWidget):
         self.btn_skna_review = QPushButton("Artifact")
         self.btn_skna_review.setToolTip(
             '依序檢視每一段 SKNA 波形，人工判讀為「保留」或「Artifact」\n'
-            '（預設保留；僅用於傳統帶通 BPF；判讀結果會寫進匯出的 Excel 總表）')
+            '（預設保留；Bandpass 與 S3 都可用；判讀結果會寫進匯出的 Excel 總表）')
         self.btn_skna_review.clicked.connect(
             lambda: self.skna_review_requested.emit())
         si_lay.addWidget(self.btn_skna_review)
@@ -6574,7 +6574,8 @@ def judge_key(t0: float, t1: float) -> str:
 class ArtifactReviewDialog(QDialog):
     """逐段檢視 SKNA 區間，人工判讀為「保留」或「Artifact」。
 
-    只用於傳統帶通（BPF）；S3 已經把心電成分分解掉，不需要這一步。
+    Bandpass 與 S3 都可用：軌道顯示哪一種就看哪一種的波形判讀，判讀結果
+    同時套用到該區段的所有指標（BPF、S3、Nerveact 相容）。
     主視窗會跟著跳到每一段（前後各多顯示一點），並把目前這段框起來。
     """
     MARGIN = 1.0   # 前後多顯示的秒數
@@ -6599,7 +6600,7 @@ class ArtifactReviewDialog(QDialog):
         top.addWidget(self.lbl_pos)
         top.addStretch()
         top.addWidget(HelpBadge(
-            '逐段檢視 SKNA 波形（傳統帶通 BPF），每段預設為「保留」，'
+            '逐段檢視 SKNA 波形（軌道上顯示 Bandpass 或 S3 都可以），每段預設為「保留」，'
             '看到 artifact 就標記為 Artifact。\n\n'
             '快捷鍵：\n'
             '  K／空白鍵　保留\n'
@@ -6739,6 +6740,9 @@ class ArtifactReviewDialog(QDialog):
         for m_, b_ in ((a, res.get('band1', '')), (a2, res.get('band2', ''))):
             if m_.get('aSKNA') is not None:
                 parts.append(f"BPF {b_} aSKNA {m_['aSKNA']:.3f} {unit}")
+        s3_ = res.get('s3', {}) if res.get('ok') else {}
+        if s3_.get('aSKNA') is not None:
+            parts.append(f"S3 aSKNA {s3_['aSKNA']:.3f} {unit}")
         if na.get('aSKNA') is not None:
             parts.append(f"Nerveact aSKNA {na['aSKNA']:.3f}"
                          + (f" / {na2['aSKNA']:.3f}" if na2.get('aSKNA') is not None else '')
@@ -6859,7 +6863,7 @@ class SknaIntervalDialog(QDialog):
         b_auto.clicked.connect(self._add_auto)
         b_rev = QPushButton('Artifact')
         b_rev.setToolTip('依序檢視每一段 SKNA 波形，預設保留，'
-                         '標出 Artifact 區段（僅 BPF）')
+                         '標出 Artifact 區段（Bandpass 與 S3 都可用）')
         b_rev.clicked.connect(lambda: self.mw._open_artifact_review(
             self._first_selected_row(), from_dialog=True))
         for b in (b_sel, b_man, b_ts, b_view, b_auto, b_rev):
@@ -7582,7 +7586,7 @@ def export_skna_xlsx(path: str, data, cfg: dict, rows: list, s3_info=None):
         ('無效訊號 (%)', '該區間內沒有有效訊號的樣本比例：放大器滿格（波形被'
                         '削平）或完全沒有變化。那些區段不含訊號內容，'
                         '數值不具物理意義'),
-        ('判讀', '人工逐段判讀結果（預設保留，標記為 Artifact 者排除），僅針對傳統帶通 BPF。'
+        ('判讀', '人工逐段判讀結果（預設保留，標記為 Artifact 者排除），套用到 BPF、S3 與 Nerveact 相容欄位。'
                 '可直接在 Excel 的判讀欄下拉修改，「總表」與 *排除 Artifact* 欄會自動重算'),
         ('品質警示', '訊號無效、心率超出生理範圍、RR 間期不穩、或波峰因數過大時'
                     '標示；僅為提示，不會自動剔除資料'),
@@ -7626,9 +7630,9 @@ def _add_judge_summary(wb, ws, headers, n_rows: int, unit: str, cfg: dict):
     col = {h: names.index(h) + 1 for h in names}
     jcol = L(col['判讀'])
     last = n_rows + 1
-    # 兩個軌道的 BPF 與 Nerveact 相容 aSKNA / iSKNA（S3 不在判讀範圍）
+    # 兩個軌道的 BPF、S3 與 Nerveact 相容 aSKNA / iSKNA
     metrics = [(h, h.rsplit(' (', 1)[0]) for h in names
-               if (' aSKNA' in h or ' iSKNA' in h) and not h.startswith('S3')]
+               if (' aSKNA' in h or ' iSKNA' in h)]
     hdr_fill = PatternFill('solid', fgColor='1F3864')
     hdr_font = Font(bold=True, color='FFFFFF', size=10)
     helper = {}
@@ -7655,9 +7659,9 @@ def _add_judge_summary(wb, ws, headers, n_rows: int, unit: str, cfg: dict):
     q = "'SKNA Intervals'!"
     sm['A1'] = 'SKNA 總表（人工 Artifact 判讀）'
     sm['A1'].font = Font(bold=True, size=13, color='1F3864')
-    sm['A2'] = (f"帶通：軌道 2 {skna_band_label(cfg, 1)} Hz、軌道 3 {skna_band_label(cfg, 2)} Hz（BPF）。"
-                '判讀僅適用 BPF 與 Nerveact 相容欄位；在 SKNA Intervals 的「判讀」'
-                '欄修改後，本頁自動重算。')
+    sm['A2'] = (f"帶通：軌道 2 {skna_band_label(cfg, 1)} Hz、軌道 3 {skna_band_label(cfg, 2)} Hz。"
+                '判讀套用到 BPF、S3 與 Nerveact 相容欄位（S3 欄位需先執行 S3 分解才有數值）；'
+                '在 SKNA Intervals 的「判讀」欄修改後，本頁自動重算。')
     jr = f'{q}${jcol}$2:${jcol}${last}'
     cnt = [('區間總數', f'=COUNTA({q}$A$2:$A${last})'),
            ('保留', f'=COUNTIF({jr},"保留")'),
@@ -8750,12 +8754,6 @@ class MainWindow(QMainWindow):
 
     def _open_artifact_review(self, start=None, from_dialog: bool = False):
         if not self._require_file():
-            return
-        if self.skna_cfg.get('method') == 's3':
-            QMessageBox.information(
-                self, 'Artifact 判讀',
-                'Artifact 逐段判讀只用於傳統帶通（BPF）。\n'
-                '目前 SKNA 設定選的是 S3，請先在「SKNA 設定」改回傳統帶通。')
             return
         if not self.skna_rows:
             QMessageBox.information(
