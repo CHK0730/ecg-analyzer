@@ -3810,6 +3810,10 @@ class WaveformWidget(QWidget):
             w = 0
         if w <= 0:
             w = 1200
+        if getattr(self, '_fast', False):
+            # 按住往前／往後連續移動時先用草稿解析度（每像素 3 點），
+            # 每一步畫得快、放開時跟得上；停下來後立刻用完整解析度重畫
+            return int(min(8_000, max(3_000, w * 3)))
         return int(min(24_000, max(8_000, w * 10)))
 
     def _reset_label_cache(self):
@@ -4334,7 +4338,8 @@ class WaveformWidget(QWidget):
         self._draw_req = False
         self._draw()
 
-    def pan(self, direction: float):
+    def pan(self, direction: float, sync: bool = False):
+        """sync=True 時當場重畫（連續平移用，確保畫完才排下一步）。"""
         if self.data is None:
             return
         win  = self.t_end - self.t_start
@@ -4344,7 +4349,10 @@ class WaveformWidget(QWidget):
             return                      # 已經到頭了，不用重畫
         self.t_start = new_start
         self.t_end   = new_start + win
-        self.request_draw()
+        if sync:
+            self._draw()
+        else:
+            self.request_draw()
 
     def zoom(self, factor: float):
         if self.data is None:
@@ -7913,7 +7921,10 @@ class MainWindow(QMainWindow):
         sep()
 
         self._pan_timer = QTimer()
-        self._pan_timer.setInterval(80)
+        # 單次計時器：每一步畫完、處理完排隊的輸入（包含放開按鈕）之後才排
+        # 下一步。用固定節拍的重複計時器時，重畫比節拍慢就會一直堆積觸發，
+        # 放開按鈕的事件被排在後面，畫面放開後還會繼續走一段。
+        self._pan_timer.setSingleShot(True)
         # 只在這裡接一次。以前是每次按下都 connect 一個新的 lambda、放開再
         # 全部 disconnect，只要有一次 released 沒收到（例如按著按鈕時鍵盤
         # 也觸發了平移），連線就會殘留，下一次連發會一次跑好幾格。
@@ -8183,27 +8194,38 @@ class MainWindow(QMainWindow):
         ms = getattr(self.waveform, '_last_draw_ms', 0.0)
         return int(min(400, max(80, ms * 1.4)))
 
+    _PAN_REPEAT_DELAY = 300   # 按住多久才開始連續移動 (ms)；一般單擊只走一步
+    _PAN_GAP = 30             # 連續移動時，每一步畫完後留給輸入事件的空檔 (ms)
+
     def _on_pan_tick(self):
         if self._pan_direction == 0:
-            self._pan_timer.stop()
             return
-        self.waveform.pan(self._pan_direction)
-        iv = self._pan_interval()
-        if iv != self._pan_timer.interval():
-            self._pan_timer.setInterval(iv)
+        direction = self._pan_direction
+        self.waveform._fast = True
+        self.waveform.pan(direction, sync=True)
+        # 把這一步的畫面真的畫出來，同時處理已經排隊的輸入。若使用者已經
+        # 放開按鈕／方向鍵，_stop_pan 會在這裡被呼叫，下面就不會再排下一步
+        QApplication.processEvents()
+        if self._pan_direction != direction or self._pan_timer.isActive():
+            return
+        self._pan_timer.start(self._PAN_GAP)
 
     def _start_pan(self, direction: int):
-        # 已經在往同一個方向連發了就不要再插一次，否則按鈕與方向鍵同時
+        # 已經在往同一個方向移動就不要再插一次，否則按鈕與方向鍵同時
         # 觸發時會一次跳兩格
-        if self._pan_timer.isActive() and self._pan_direction == direction:
+        if self._pan_direction == direction:
             return
         self._pan_direction = direction
-        self.waveform.pan(direction)          # 立即移動一次
-        self._pan_timer.start(self._pan_interval())
+        self.waveform.pan(direction, sync=True)      # 立即移動一次
+        self._pan_timer.start(self._PAN_REPEAT_DELAY)
 
     def _stop_pan(self):
         self._pan_direction = 0
         self._pan_timer.stop()
+        if getattr(self.waveform, '_fast', False):
+            # 連續移動結束：用完整解析度重畫一次
+            self.waveform._fast = False
+            self.waveform.request_draw()
 
     def _toggle_dual(self, on: bool):
         self.waveform.toggle_dual(on)
