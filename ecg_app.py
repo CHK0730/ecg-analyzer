@@ -2566,6 +2566,7 @@ class SidePanel(QWidget):
         self.lbl_mark_hint = QLabel('')
         self.lbl_mark_hint.setWordWrap(True)
         self.lbl_mark_hint.setStyleSheet(f'color:{C["dim"]};font-size:11px;')
+        self.lbl_mark_hint.setVisible(False)       # 清單下方的文字說明不顯示
         sm_lay.addWidget(self.lbl_mark_hint)
         lay.addWidget(self.grp_skna_marks)
 
@@ -2613,6 +2614,7 @@ class SidePanel(QWidget):
         self.lbl_skna_hint = QLabel('')
         self.lbl_skna_hint.setWordWrap(True)
         self.lbl_skna_hint.setStyleSheet(f'color:{C["dim"]};font-size:11px;')
+        self.lbl_skna_hint.setVisible(False)       # 清單下方的文字說明不顯示
         si_lay.addWidget(self.lbl_skna_hint)
         lay.addWidget(self.grp_skna_iv)
 
