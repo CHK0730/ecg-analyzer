@@ -4849,8 +4849,8 @@ class FilterSettingsDialog(QDialog):
         self.setStyleSheet(
             f'QDialog{{{base_style}}}'
             f'QGroupBox{{color:{C["accent"]};border:1px solid {C["border"]};'
-            f'border-radius:6px;margin-top:{group_title_margin()}px;'
-            f'padding:{group_title_margin() - 4}px 10px 8px 10px;}}'
+            f'border-radius:6px;margin-top:{group_title_margin(13, _UI_FONT_FAMILIES)}px;'
+            f'padding:{group_title_margin(13, _UI_FONT_FAMILIES) - 4}px 10px 8px 10px;}}'
             f'QGroupBox::title{{subcontrol-origin:margin;left:10px;'
             f'padding:0 4px;color:{C["accent"]};font-weight:bold;}}'
             f'QRadioButton{{color:{C["text"]};spacing:6px;}}'
@@ -5602,24 +5602,41 @@ def parse_time_str(txt: str):
 _DLG_STYLE_CACHE = None
 
 
-def group_title_margin() -> int:
-    """群組框標題要留多高才不會被切到。
+_UI_FONT_FAMILIES = ['SF Mono', 'Menlo', 'Consolas', 'Cascadia Mono', 'monospace']
 
-    標題是粗體，中文字的高度又比英數大。寫死一個像素值在某些系統／字體
-    設定下就會不夠（標題的上下會被裁掉），所以依目前實際字體算出來。
+
+def title_text_height(px: int | None = None, families=None) -> int:
+    """粗體中文標題實際畫出來的高度（像素）。
+
+    介面用的是等寬英文字型（SF Mono／Menlo），裡面沒有中文字，中文會由
+    系統改用蘋方等字型補上，而那些字型比英文字型高。只看英文字型的
+    height() 會低估，標題頂端就被裁掉，所以要用中文字實際量。
     """
     try:
         f = QFont(QApplication.font())
+        if families:
+            f.setFamilies(list(families))
+        if px:
+            f.setPixelSize(int(px))
         f.setBold(True)
-        return max(16, QFontMetrics(f).height() + 4)
+        fm = QFontMetrics(f)
+        sample = '檔案資訊設定區間國Ag'
+        return int(max(fm.height(), fm.lineSpacing(),
+                       fm.boundingRect(sample).height(),
+                       fm.tightBoundingRect(sample).height() + 4))
     except Exception:
-        return 20
+        return 18
+
+
+def group_title_margin(px: int | None = None, families=None) -> int:
+    """群組框標題要留多高才不會被切到（依實際中文字形高度計算）。"""
+    return max(18, title_text_height(px, families) + 6)
 
 
 def _dialog_style() -> str:
     global _DLG_STYLE_CACHE
     if _DLG_STYLE_CACHE is None:
-        _mt = group_title_margin()
+        _mt = group_title_margin(13, _UI_FONT_FAMILIES)
         _DLG_STYLE_CACHE = (
             f'QDialog{{background:{C["bg"]};color:{C["text"]};font-size:12px;}}'
             f'QGroupBox{{color:{C["accent"]};border:1px solid {C["border"]};'
@@ -9540,7 +9557,13 @@ def main():
         app.setWindowIcon(QIcon(_icon))
     app.setApplicationVersion('5.0')
     app.setOrganizationName('Lab Tools')
-    app.setStyleSheet(STYLESHEET)
+    # 群組框標題的預留高度要等 QApplication 建好、能量字型之後才算得出來
+    _gm = group_title_margin(11, _UI_FONT_FAMILIES)
+    app.setStyleSheet(
+        STYLESHEET
+        + f'QGroupBox {{ margin-top: {_gm}px; }}'
+        + 'QGroupBox::title { subcontrol-origin: margin; left: 10px; top: 0px;'
+        + ' padding: 0px 3px; }')
 
     win = MainWindow()
     win.show()
