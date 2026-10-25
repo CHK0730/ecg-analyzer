@@ -156,10 +156,17 @@ def _boost_color(hex_color: str, sat: float = 1.15, val: float = 1.04) -> str:
 
 if _IS_WIN:
     # Windows 一般螢幕沒有 macOS 的廣色域與色彩管理，同樣的色碼看起來比較灰；
-    # 強調色、波形與標記色提高飽和度。背景、面板、框線與灰階文字維持不變。
+    # 強調色、波形與標記色提高飽和度。框線與灰階文字維持不變。
     for _k in list(C):
         if _k not in ('bg', 'panel', 'border', 'text', 'dim'):
             C[_k] = _boost_color(C[_k])
+    # 背景與面板再深一點（Windows 螢幕的黑位通常比 Mac 浮，原本的深灰藍
+    # 看起來偏灰）；兩者保持原本的明暗差，面板仍分得出層次
+    C['bg'] = '#06080b'
+    C['panel'] = '#0e1216'
+
+# 波形圖背景跟著介面背景（Windows 會被上面改深）
+pg.setConfigOptions(background=C['bg'])
 
 STYLESHEET = f"""
 QMainWindow, QWidget {{
@@ -4755,7 +4762,8 @@ class WaveformWidget(QWidget):
                         line,
                         f"{'▶' if is_start else '■'} {m.get('name', '')}",
                         position=0.94, color=col, movable=False,
-                        fill=pg.mkBrush(QColor(13, 17, 23, 200)))
+                        fill=pg.mkBrush(QColor(C['bg']).red(), QColor(C['bg']).green(),
+                                        QColor(C['bg']).blue(), 200))
                 plot.addItem(line)
                 self._mark_items.append((line, plot))
 
