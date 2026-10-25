@@ -143,6 +143,24 @@ C = {
     'meas_b':   '#79c0ff',
 }
 
+
+def _boost_color(hex_color: str, sat: float = 1.15, val: float = 1.04) -> str:
+    """提高飽和度與亮度（HSV），用於 Windows。"""
+    import colorsys
+    h = hex_color.lstrip('#')
+    r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    hh, ss, vv = colorsys.rgb_to_hsv(r, g, b)
+    r, g, b = colorsys.hsv_to_rgb(hh, min(1.0, ss * sat), min(1.0, vv * val))
+    return '#{:02x}{:02x}{:02x}'.format(*(int(round(x * 255)) for x in (r, g, b)))
+
+
+if _IS_WIN:
+    # Windows 一般螢幕沒有 macOS 的廣色域與色彩管理，同樣的色碼看起來比較灰；
+    # 強調色、波形與標記色提高飽和度。背景、面板、框線與灰階文字維持不變。
+    for _k in list(C):
+        if _k not in ('bg', 'panel', 'border', 'text', 'dim'):
+            C[_k] = _boost_color(C[_k])
+
 STYLESHEET = f"""
 QMainWindow, QWidget {{
     background-color: {C['bg']};
