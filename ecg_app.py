@@ -9606,6 +9606,18 @@ def main():
     app.setApplicationName('ECG Analyzer V5')
     # Dock / 視窗圖示（由 ECG Analyzer.app 傳入）
     _icon = os.environ.get('ECG_APP_ICON')
+    if not _icon and _IS_WIN:
+        # Windows：視窗與工作列用跟 macOS 版相同的圖示
+        _icon = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'ECG Analyzer.ico')
+        try:
+            # 沒有這行的話，Windows 會把視窗歸在 python.exe 底下，
+            # 工作列顯示的是 Python 的圖示而不是本程式的
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                'LabTools.ECGAnalyzer.V5')
+        except Exception:
+            pass
     if _icon and os.path.exists(_icon):
         from PyQt6.QtGui import QIcon
         app.setWindowIcon(QIcon(_icon))

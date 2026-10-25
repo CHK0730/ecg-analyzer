@@ -124,13 +124,16 @@ echo 建立桌面捷徑...
 
 set "LAUNCHER=%DIR%啟動 ECG Analyzer V5.bat"
 set "SHORTCUT=%USERPROFILE%\Desktop\ECG Analyzer V5.lnk"
+REM  圖示與 macOS 版相同（ECG Analyzer.ico）；找不到時才用系統內建圖示
+set "ICON=%DIR%ECG Analyzer.ico,0"
+if not exist "%DIR%ECG Analyzer.ico" set "ICON=%SystemRoot%\System32\shell32.dll,220"
 
 powershell -NoProfile -Command ^
     "$d = [Environment]::GetFolderPath('Desktop');" ^
     "$s = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'ECG Analyzer V5.lnk'));" ^
     "$s.TargetPath = '%LAUNCHER%';" ^
     "$s.WorkingDirectory = '%DIR%';" ^
-    "$s.IconLocation = '%SystemRoot%\System32\shell32.dll,220';" ^
+    "$s.IconLocation = '%ICON%';" ^
     "$s.Description = 'ECG Analyzer V5';" ^
     "$s.Save()" >nul 2>nul
 
