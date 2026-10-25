@@ -123,21 +123,44 @@ REM ── 建立桌面捷徑 ────────────────�
 echo 建立桌面捷徑...
 
 set "LAUNCHER=%DIR%啟動 ECG Analyzer V5.bat"
-set "SHORTCUT=%USERPROFILE%\Desktop\ECG Analyzer V5.lnk"
-REM  圖示與 macOS 版相同（ECG Analyzer.ico）；找不到時才用系統內建圖示
-set "ICON=%DIR%ECG Analyzer.ico,0"
-if not exist "%DIR%ECG Analyzer.ico" set "ICON=%SystemRoot%\System32\shell32.dll,220"
+
+REM  圖示與 macOS 版相同（ECG Analyzer.ico）。先複製到本機的
+REM  %LOCALAPPDATA%\ECG Analyzer\ 再給捷徑用：程式資料夾若在網路位置
+REM  （例如 Parallels 的 C:\Mac\Home\…），桌面捷徑常讀不到那裡的圖示，
+REM  會顯示成空白頁。找不到 .ico 時才用系統內建圖示。
+set "ICON_SRC=%DIR%ECG Analyzer.ico"
+set "ICON_DIR=%LOCALAPPDATA%\ECG Analyzer"
+set "ICON=%SystemRoot%\System32\shell32.dll"
+set "ICON_IDX=220"
+if exist "%ICON_SRC%" (
+    if not exist "%ICON_DIR%" mkdir "%ICON_DIR%" >nul 2>nul
+    copy /y "%ICON_SRC%" "%ICON_DIR%\ECG Analyzer.ico" >nul 2>nul
+    if exist "%ICON_DIR%\ECG Analyzer.ico" (
+        set "ICON=%ICON_DIR%\ECG Analyzer.ico"
+        set "ICON_IDX=0"
+    )
+)
+
+REM  路徑改用環境變數交給 PowerShell：直接寫進命令列時，中文或特殊字元
+REM  在 UTF-8 命令列下可能被轉壞
+set "ECG_LNK_TARGET=%LAUNCHER%"
+set "ECG_LNK_DIR=%DIR%"
+set "ECG_LNK_ICON=%ICON%,%ICON_IDX%"
 
 powershell -NoProfile -Command ^
     "$d = [Environment]::GetFolderPath('Desktop');" ^
     "$s = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'ECG Analyzer V5.lnk'));" ^
-    "$s.TargetPath = '%LAUNCHER%';" ^
-    "$s.WorkingDirectory = '%DIR%';" ^
-    "$s.IconLocation = '%ICON%';" ^
+    "$s.TargetPath = $env:ECG_LNK_TARGET;" ^
+    "$s.WorkingDirectory = $env:ECG_LNK_DIR;" ^
+    "$s.IconLocation = $env:ECG_LNK_ICON;" ^
     "$s.Description = 'ECG Analyzer V5';" ^
     "$s.Save()" >nul 2>nul
+set "LNK_ERR=%errorlevel%"
 
-if errorlevel 1 (
+REM  重新整理 Windows 的圖示快取，否則捷徑可能還顯示舊圖示
+ie4uinit.exe -show >nul 2>nul
+
+if not "%LNK_ERR%"=="0" (
     echo [提示] 桌面捷徑建立失敗，可直接雙擊「啟動 ECG Analyzer V5.bat」開啟
 ) else (
     echo [OK] 已在桌面建立「ECG Analyzer V5」捷徑
