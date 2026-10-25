@@ -107,6 +107,21 @@ def build_stamp() -> str:
         return '—'
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 介面字型
+# ══════════════════════════════════════════════════════════════════════════════
+# macOS：等寬的 SF Mono／Menlo，中文由系統的蘋方補上。
+# Windows：沒有 SF Mono 與蘋方，原本英文用 Consolas、中文交給系統隨意替代，
+# 字形很不一致；改成整個介面用微軟正黑體（本身含英數字），中英文一致。
+# Qt 的樣式表不會依清單逐字改用第二個字型補中文，所以 Windows 直接把
+# 正黑體放第一位，而不是「Consolas + 正黑體」。
+_IS_WIN = sys.platform.startswith('win')
+if _IS_WIN:
+    _UI_FONT_FAMILIES = ['Microsoft JhengHei UI', 'Microsoft JhengHei', 'Segoe UI']
+else:
+    _UI_FONT_FAMILIES = ['SF Mono', 'Menlo', 'Consolas', 'Cascadia Mono', 'monospace']
+_FONT_CSS = ', '.join(f if f == 'monospace' else f"'{f}'" for f in _UI_FONT_FAMILIES)
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 顏色主題
 # ══════════════════════════════════════════════════════════════════════════════
 C = {
@@ -132,7 +147,7 @@ STYLESHEET = f"""
 QMainWindow, QWidget {{
     background-color: {C['bg']};
     color: {C['text']};
-    font-family: 'SF Mono', 'Menlo', 'Consolas', 'Cascadia Mono', monospace;
+    font-family: {_FONT_CSS};
     font-size: 12px;
 }}
 QToolBar {{
@@ -4773,7 +4788,9 @@ class DropZone(QWidget):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(
             f'color: {C["accent"]}; font-size: 28px; font-weight: bold; '
-            f'font-family: "SF Pro Display", "Helvetica Neue", "Segoe UI", "Microsoft JhengHei";')
+            + ('font-family: "Microsoft JhengHei UI", "Microsoft JhengHei", "Segoe UI";'
+               if _IS_WIN else
+               'font-family: "SF Pro Display", "Helvetica Neue", "Segoe UI", "Microsoft JhengHei";'))
         lay.addWidget(title)
 
         sub = QLabel('拖放 .abf / .edf / .acq 檔案到這裡，或點擊開啟')
@@ -5616,13 +5633,10 @@ def parse_time_str(txt: str):
 _DLG_STYLE_CACHE = None
 
 
-_UI_FONT_FAMILIES = ['SF Mono', 'Menlo', 'Consolas', 'Cascadia Mono', 'monospace']
-
-
 def title_text_height(px: int | None = None, families=None) -> int:
     """粗體中文標題實際畫出來的高度（像素）。
 
-    介面用的是等寬英文字型（SF Mono／Menlo），裡面沒有中文字，中文會由
+    macOS 介面用的是等寬英文字型（SF Mono／Menlo），裡面沒有中文字，中文會由
     系統改用蘋方等字型補上，而那些字型比英文字型高。只看英文字型的
     height() 會低估，標題頂端就被裁掉，所以要用中文字實際量。
     """
@@ -9571,6 +9585,11 @@ def main():
         app.setWindowIcon(QIcon(_icon))
     app.setApplicationVersion('5.0')
     app.setOrganizationName('Lab Tools')
+    if _IS_WIN:
+        # 座標軸刻度與標題等不經過樣式表的文字也統一用微軟正黑體
+        _f = QFont(app.font())
+        _f.setFamilies(list(_UI_FONT_FAMILIES))
+        app.setFont(_f)
     # 群組框標題的預留高度要等 QApplication 建好、能量字型之後才算得出來
     _gm = group_title_margin(11, _UI_FONT_FAMILIES)
     app.setStyleSheet(
