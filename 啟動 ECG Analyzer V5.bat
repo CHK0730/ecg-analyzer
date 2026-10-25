@@ -8,8 +8,9 @@ exit /b %errorlevel%
 :main
 REM ============================================================
 REM  ECG Analyzer V5 啟動器 (Windows)
-REM  支援 .abf 和 .edf 格式
-REM  雙擊此檔案即可開啟；也可將 .abf/.edf 檔案拖放到此檔案上開啟
+REM  支援 .abf / .edf / .acq 格式
+REM  雙擊此檔案即可開啟；也可將檔案拖放到此檔案上開啟
+REM  注意：本檔必須是 CRLF 換行（.gitattributes 已設定）。
 REM ============================================================
 setlocal enabledelayedexpansion
 
@@ -23,22 +24,20 @@ if not exist "%SCRIPT%" (
     exit /b 1
 )
 
-REM ── 找出實際的 python.exe 完整路徑（不依賴 py launcher 的 -w 參數，
-REM     因為新版 Python（Microsoft Store / winget 安裝的 pythoncore）
-REM     的 py 指令不支援 -w） ──
+REM ── 問 Python 自己的完整路徑（sys.executable）──
+REM  不用 where python：它可能先找到 Microsoft Store 的 python 捷徑
+REM  （WindowsApps 資料夾），那個只會開啟商店，程式根本跑不起來。
 set "PYPATH="
-for /f "delims=" %%I in ('where python 2^>nul') do (
-    if not defined PYPATH set "PYPATH=%%I"
-)
-
-if not defined PYPATH (
-    for /f "delims=" %%I in ('py -c "import sys; print(sys.executable)" 2^>nul') do (
-        if not defined PYPATH set "PYPATH=%%I"
+for %%C in ("py -3" "python") do (
+    if not defined PYPATH (
+        for /f "delims=" %%I in ('%%~C -c "import sys; print(sys.executable)" 2^>nul') do (
+            if not defined PYPATH set "PYPATH=%%I"
+        )
     )
 )
 
 if not defined PYPATH (
-    echo [錯誤] 找不到 Python，請先雙擊 install.bat 進行安裝。
+    echo [錯誤] 找不到可以執行的 Python，請先雙擊 install.bat 進行安裝。
     pause
     exit /b 1
 )
@@ -64,6 +63,7 @@ if errorlevel 1 (
     type "%LOG%"
     echo ------------------------------------------------------------
     echo 完整紀錄已儲存於：%LOG%
+    echo 若訊息是 No module named ...，請先雙擊 install.bat 安裝套件。
     echo.
     pause
     start "" notepad "%LOG%"

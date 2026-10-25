@@ -1,0 +1,5 @@
+# Windows 批次檔必須是 CRLF：LF 換行時 cmd 找不到 :main 等標籤，安裝／啟動會失敗
+*.bat     text eol=crlf
+# macOS 的 .command 是 shell script，必須是 LF
+*.command text eol=lf
+*.py      text eol=lf
