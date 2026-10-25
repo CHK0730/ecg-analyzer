@@ -162,8 +162,8 @@ if _IS_WIN:
             C[_k] = _boost_color(C[_k])
     # 背景與面板再深一點（Windows 螢幕的黑位通常比 Mac 浮，原本的深灰藍
     # 看起來偏灰）；兩者保持原本的明暗差，面板仍分得出層次
-    C['bg'] = '#06080b'
-    C['panel'] = '#0e1216'
+    C['bg'] = '#010203'
+    C['panel'] = '#090b0e'
 
 # 波形圖背景跟著介面背景（Windows 會被上面改深）
 pg.setConfigOptions(background=C['bg'])
