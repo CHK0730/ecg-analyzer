@@ -3954,7 +3954,9 @@ class WaveformWidget(QWidget):
             else:
                 self._curve_skna_env.setData([], [])
             if self._y_auto1:
-                self._auto_y_range(self.plot_wave2, y2)
+                # SKNA 模式（有包絡線）時以 0 為中心
+                self._auto_y_range(self.plot_wave2, y2,
+                                   symmetric=env2 is not None)
             self.plot_wave2.setVisible(True)
             # 標題列一律保留。SKNA 模式下只是把通道選單鎖起來（來源由 SKNA
             # 設定決定），▲ ▼ 自動 這些縱軸按鈕仍然要能用。
@@ -3982,7 +3984,7 @@ class WaveformWidget(QWidget):
             self._curve_wave3.setData(t3, y3)
             self._curve_skna_env3.setData(*env3)
             if self._y_auto2:
-                self._auto_y_range(self.plot_wave3, y3)
+                self._auto_y_range(self.plot_wave3, y3, symmetric=True)
             self.plot_wave3.setVisible(True)
             self.hdr3_widget.setVisible(True)
             self.plot_rr.setVisible(False)
@@ -4390,6 +4392,14 @@ class WaveformWidget(QWidget):
         plot = {0: self.plot_wave, 1: self.plot_wave2}.get(ch, self.plot_wave3)
         vr = plot.viewRange()
         y_min, y_max = vr[1]
+        skna_track = (ch == 2 or (ch == 1 and self.skna_enabled
+                                  and self.skna_cfg.get('src_ch') is not None))
+        if skna_track:
+            # SKNA 軌道以 0 為中心縮放。以「目前畫面中心」縮放的話，自動範圍
+            # 只要上下不對稱，每按一次中心就偏一點，0 會越飄越遠
+            y_half = max(abs(y_min), abs(y_max)) / factor
+            plot.setYRange(-y_half, y_half, padding=0)
+            return
         y_center = (y_min + y_max) / 2
         y_half = (y_max - y_min) / 2 / factor
         plot.setYRange(y_center - y_half, y_center + y_half, padding=0)
@@ -4407,7 +4417,7 @@ class WaveformWidget(QWidget):
         self._draw()
 
     @staticmethod
-    def _auto_y_range(plot, y, extra=None):
+    def _auto_y_range(plot, y, extra=None, symmetric: bool = False):
         """依目前可見資料設定縱軸範圍。
 
         不直接用 pyqtgraph 的 enableAutoRange，因為訊號幾乎是常數時
@@ -4438,6 +4448,10 @@ class WaveformWidget(QWidget):
         else:
             pad = span * 0.08
         new_lo, new_hi = lo - pad, hi + pad
+        if symmetric:
+            # SKNA 是以 0 為中心的訊號：範圍上下對稱，0 固定在正中間
+            m = max(abs(new_lo), abs(new_hi))
+            new_lo, new_hi = -m, m
 
         # 只有在範圍真的變了才設。每次平移都重設縱軸有兩個代價：
         # pyqtgraph 要丟掉整個座標軸的繪圖快取重畫（實測是平移時最貴的
